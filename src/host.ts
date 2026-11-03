@@ -103,17 +103,21 @@ function staticUrl(text: string): URL | undefined {
 }
 
 function pages(op: Operation): string[] {
-  const url = staticUrl(op.trigger.url);
+  const url = op.trigger ? staticUrl(op.trigger.url) : undefined;
   return url ? [url.origin + url.pathname.split(PARAM)[0]!] : [];
 }
 
 function urlsOf(op: Pick<Operation, "request" | "trigger" | "slots"> & Partial<Pick<Operation, "readback">>): string[] {
   return [
-    op.request.url,
+    ...(op.request ? [op.request.url] : []),
     ...op.slots.flatMap((s) => (s.from ? [s.from.request.url] : [])),
-    op.trigger.url,
-    ...(op.trigger.softFrom ? [op.trigger.softFrom] : []),
-    ...(op.trigger.steps ?? []).flatMap((s) => (s.action === "goto" && s.value ? [s.value] : [])),
+    ...(op.trigger
+      ? [
+          op.trigger.url,
+          ...(op.trigger.softFrom ? [op.trigger.softFrom] : []),
+          ...(op.trigger.steps ?? []).flatMap((s) => (s.action === "goto" && s.value ? [s.value] : [])),
+        ]
+      : []),
     ...(op.readback && "read" in op.readback ? urlsOf(op.readback.read) : []),
   ];
 }
@@ -290,7 +294,7 @@ function previewSession(op: Operation, effective: Session, stored: Session, bare
   if (bare) return shown;
   let domain: string;
   try {
-    domain = new URL(op.request.url).hostname.toLowerCase();
+    domain = new URL(op.request?.url ?? "").hostname.toLowerCase();
   } catch {
     return shown; // buildRequest reports the URL
   }
@@ -347,8 +351,9 @@ function previewTrigger(
   args: Record<string, unknown>,
   hide: (text: string) => string,
 ): NonNullable<ReadyPlan["trigger"]> {
-  const { url, softFrom, steps } = fillTrigger(op.trigger, args);
-  const { confirms, companions } = op.trigger;
+  const trigger = op.trigger!; // a local op has no page; a local write at tier 3 is refused above (callOnlyWriteRefusal)
+  const { url, softFrom, steps } = fillTrigger(trigger, args);
+  const { confirms, companions } = trigger;
   return {
     url: hide(url),
     ...(softFrom ? { softFrom: hide(softFrom) } : {}),

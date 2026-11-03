@@ -309,7 +309,7 @@ export function tierBlocked(
 export function callOnlyWriteRefusal(site: string, op: Operation, tier: Tier): Result | undefined {
   if (op.readOnly || tier !== 3) return undefined;
   const missing = [
-    ...(op.trigger.companions === undefined ? ["no recorded companions list"] : []),
+    ...(op.trigger?.companions === undefined ? ["no recorded companions list"] : []),
     ...(!Object.keys(op.match).length ? ["an empty match"] : []),
   ];
   if (!missing.length) return undefined;
@@ -358,7 +358,7 @@ export function bareCall(site: Pick<Site, "shared">, op: Operation): boolean {
   // a local op's command takes only its params: nothing of the user's goes to the site
   if (op.local) return true;
   if (site.shared?.by !== "agent") return false;
-  const method = op.request.method.toUpperCase();
+  const method = op.request!.method.toUpperCase();
   return method !== "GET" && method !== "HEAD";
 }
 

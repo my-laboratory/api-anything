@@ -192,7 +192,7 @@ test("a login on another site of the same registrable domain counts where the sh
     operations: [
       {
         ...site.operations[0]!,
-        request: { ...site.operations[0]!.request, url: `${origin}/api/search?q=alice` },
+        request: { ...site.operations[0]!.request!, url: `${origin}/api/search?q=alice` },
         trigger: { url: `${origin}/search?q={q}` },
       },
     ],
@@ -372,7 +372,7 @@ test("a stored session value the request fills counts as signed in, and its arri
   const bearer = { ref: "session:bearer", at: ["header:authorization"] };
   const withBearer = (op: Site["operations"][number]) => ({
     ...op,
-    request: { ...op.request, headers: { ...op.request.headers, authorization: "" } },
+    request: { ...op.request!, headers: { ...op.request!.headers, authorization: "" } },
     slots: [...op.slots, bearer],
   });
   saveSite({ ...site, operations: site.operations.map((op) => (op.name === "todos" ? op : withBearer(op))) });
@@ -429,7 +429,7 @@ test("a session: ref shows its placeholder before a tier-3 run first captures it
       {
         ...op,
         minTier: 3,
-        request: { ...op.request, headers: { "x-guest-token": "" } },
+        request: { ...op.request!, headers: { "x-guest-token": "" } },
         slots: [...op.slots, { ref: "session:x-guest-token", at: ["header:x-guest-token"] }],
       },
     ],
@@ -440,7 +440,7 @@ test("a session: ref shows its placeholder before a tier-3 run first captures it
   assert.equal(before.request.headers["x-guest-token"], "<x-guest-token>");
   // What a read's tier-3 run stores: the page's anonymous cookies and the op's session value.
   mergeCapture("fixture", [cookie("NID", "511=set-by-the-page")], {
-    from: op.request.url,
+    from: op.request!.url,
     values: { "x-guest-token": "1700000000123456789" },
   });
   assert.deepEqual(planCall("fixture", "search"), before);
@@ -463,7 +463,7 @@ test("a bearer a tier-3 page captured from its storage makes the next plan signe
       {
         ...op,
         minTier: 3,
-        request: { ...op.request, headers: { authorization: "" } },
+        request: { ...op.request!, headers: { authorization: "" } },
         slots: [...op.slots, { ref: "session:authorization", at: ["header:authorization"] }],
       },
     ],
@@ -472,7 +472,7 @@ test("a bearer a tier-3 page captured from its storage makes the next plan signe
   assert.ok(before.ok, JSON.stringify(before));
   assert.equal(before.tier, 3);
   assert.equal(before.signedIn, false);
-  mergeCapture("fixture", [], { from: op.request.url, values: { authorization: "Bearer stored-in-local-storage" } });
+  mergeCapture("fixture", [], { from: op.request!.url, values: { authorization: "Bearer stored-in-local-storage" } });
   const after = planCall("fixture", "search");
   assert.ok(after.ok);
   assert.equal(after.signedIn, true, "the page holds an account bearer even though it fills it itself");
@@ -534,7 +534,7 @@ test("planning redacts cookie/session values and encoded copies; fingerprints bi
     operations: [
       {
         ...op,
-        request: { ...op.request, headers: { authorization: "" } },
+        request: { ...op.request!, headers: { authorization: "" } },
         slots: [...op.slots, { ref: "session:bearer", at: ["header:authorization"] }],
       },
     ],
@@ -585,7 +585,7 @@ test("writes require allowWrites, send once, read back, then refuse duplicates",
 test("changed spec, trigger, write flag, readback, arguments or preview refuses approval before sending", async () => {
   const plan = planned("addTodo", { title: "approval task" });
   for (const alter of [
-    (op: Site["operations"][number]) => ({ ...op, request: { ...op.request, url: `${fixture.url}/api/elsewhere` } }),
+    (op: Site["operations"][number]) => ({ ...op, request: { ...op.request!, url: `${fixture.url}/api/elsewhere` } }),
     (op: Site["operations"][number]) => ({ ...op, trigger: { url: `${fixture.url}/changed` } }),
     (op: Site["operations"][number]) => ({ ...op, readOnly: true }),
     (op: Site["operations"][number]) => ({ ...op, readback: undefined }),
@@ -1098,7 +1098,7 @@ test("signedIn checks own-profile cookie names across registrable domains withou
     operations: [
       {
         ...site.operations[0]!,
-        request: { ...site.operations[0]!.request, url: "https://www.example.co.uk/api/search?q=alice" },
+        request: { ...site.operations[0]!.request!, url: "https://www.example.co.uk/api/search?q=alice" },
         trigger: { url: "https://www.example.co.uk/search?q={q}" },
       },
     ],

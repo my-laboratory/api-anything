@@ -198,7 +198,7 @@ export function filledValues(op: Pick<Operation, "request" | "slots">, session: 
   const refs = op.slots.flatMap((s) => [...(s.ref ? [s.ref] : []), ...templateRefs(s.template ?? "")]);
   const filled = (ref: string) => {
     try {
-      return !!resolveRef(ref, session, op.request.url);
+      return !!resolveRef(ref, session, op.request?.url ?? "");
     } catch {
       return !!session.values[ref.slice("session:".length)]; // an unparseable URL: count what is stored
     }

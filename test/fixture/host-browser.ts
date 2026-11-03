@@ -66,7 +66,7 @@ mock.module(new URL("../../src/heal.ts", import.meta.url).href, {
       const matched = {
         id: 1,
         resourceType: "fetch",
-        request: op.request,
+        request: op.request!,
         response: {
           status: triggerStatus,
           headers: {},
@@ -74,7 +74,7 @@ mock.module(new URL("../../src/heal.ts", import.meta.url).href, {
           contentType: "application/json",
         },
       };
-      return { matched, capture: { cookies: [], exchanges: [matched], finalUrl: op.trigger.url } };
+      return { matched, capture: { cookies: [], exchanges: [matched], finalUrl: op.trigger!.url } };
     },
   },
 });
@@ -225,7 +225,7 @@ for (const missing of ["companions", "match"] as const) {
     const op = { ...site.operations[1]!, minTier: 3 as const };
     saveSite({ ...site, operations: [op] });
     const approved = plan("write");
-    const { companions: _companions, ...oldTrigger } = op.trigger;
+    const { companions: _companions, ...oldTrigger } = op.trigger!;
     saveSite({
       ...site,
       operations: [{ ...op, ...(missing === "match" ? { match: {} } : { trigger: oldTrigger }) }],
@@ -258,7 +258,7 @@ test("a callOnly read can refresh profile cookies and run tier 3 without healing
     operations: [
       {
         ...op,
-        request: { ...op.request, headers: { authorization: "" } },
+        request: { ...op.request!, headers: { authorization: "" } },
         slots: [{ ref: "session:bearer", at: ["header:authorization"] }],
       },
     ],
@@ -329,7 +329,7 @@ test("a public credential read stays auth after tier-2 recovery, without calling
       {
         ...op,
         public: ["authorization"],
-        request: { ...op.request, headers: { authorization } },
+        request: { ...op.request!, headers: { authorization } },
       },
     ],
   });
