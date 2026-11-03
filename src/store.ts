@@ -36,7 +36,13 @@ import { ensureDir, home, loadSession, readJson, safeName, withLock, writePrivat
 import { type Operation, parseSite, type Request, type Site } from "./spec.js";
 import { vetShared } from "./vet.js";
 
-export const BUNDLED_DIR = fileURLToPath(new URL("../sites", import.meta.url));
+let bundledOverride: string | undefined;
+/** Resolve lazily: a compiled host supplies its extracted specs before the first load. */
+export const bundledDir = () => bundledOverride ?? fileURLToPath(new URL("../sites", import.meta.url));
+/** Override the bundled directory for every default spec and notes lookup in this process. */
+export function setBundledDir(dir: string): void {
+  bundledOverride = dir;
+}
 export const userSitesDir = () => join(home(), "sites");
 /** Specs `pull` fetched from the registry: someone else's, so checked again on every load. */
 export const registryDir = () => join(home(), "registry");
@@ -47,17 +53,17 @@ export interface Resolved {
   path: string;
 }
 
-const specDirs = (bundledDir: string) =>
+const specDirs = (bundled: string) =>
   [
     [userSitesDir(), "user"],
     [registryDir(), "registry"],
-    [bundledDir, "bundled"],
+    [bundled, "bundled"],
   ] as const;
 
-export function loadSite(name: string, bundledDir = BUNDLED_DIR): Resolved | undefined {
+export function loadSite(name: string, directory = bundledDir()): Resolved | undefined {
   name = safeName(name);
   const file = `${name}.json`;
-  for (const [dir, source] of specDirs(bundledDir)) {
+  for (const [dir, source] of specDirs(directory)) {
     const path = join(dir, file);
     if (!existsSync(path)) continue;
     try {
@@ -87,7 +93,7 @@ export function siteNotes(
   name: string,
   o: { bundledDir?: string; from?: Resolved["source"] } = {},
 ): string | undefined {
-  for (const [dir, source] of specDirs(o.bundledDir ?? BUNDLED_DIR)) {
+  for (const [dir, source] of specDirs(o.bundledDir ?? bundledDir())) {
     if (o.from && source !== o.from) continue;
     const text = notesAt(join(dir, `${safeName(name)}.md`));
     if (text === undefined) continue;
@@ -99,9 +105,9 @@ export function siteNotes(
 
 const notesAt = (path: string) => (existsSync(path) ? readFileSync(path, "utf8") : undefined);
 
-export function listSites(bundledDir = BUNDLED_DIR): string[] {
+export function listSites(directory = bundledDir()): string[] {
   const names = new Set<string>();
-  for (const [dir] of specDirs(bundledDir)) {
+  for (const [dir] of specDirs(directory)) {
     if (!existsSync(dir)) continue;
     for (const f of readdirSync(dir)) if (f.endsWith(".json")) names.add(f.slice(0, -5));
   }
@@ -344,15 +350,16 @@ export function clearCoolDown(site: string): void {
 
 const paceFile = () => join(home(), "pace.json");
 const ownSlots = new Map<string, number>();
+/** A gap between two sends is the interval ± this share of it: an exact period is a robot's. */
+export const PACE_JITTER = 0.3;
 
 /**
  * Reserve the next moment a request may go to `site`, and move the site's slot on by the interval
- * ±30% (an exact period is a robot's). The slots are kept in pace.json under its lock, so separate
- * processes (a CLI loop, agents in parallel) queue up too; a home that cannot be written paces this
- * process only.
+ * ±`PACE_JITTER`. The slots are kept in pace.json under its lock, so separate processes (a CLI loop,
+ * agents in parallel) queue up too; a home that cannot be written paces this process only.
  */
 export function reserveSend(site: string, intervalMs: number, now = Date.now()): number {
-  const gap = Math.round(intervalMs * (0.7 + Math.random() * 0.6));
+  const gap = Math.round(intervalMs * (1 - PACE_JITTER + Math.random() * 2 * PACE_JITTER));
   try {
     return withLock(paceFile(), () => {
       let slots: Record<string, unknown>;

@@ -49,13 +49,11 @@ import {
   withDefaults,
 } from "./http.js";
 import { loadSettings } from "./identity.js";
-import { reimportIfBrowser } from "./login.js";
 import { derive, LookupFailed, sendDerived } from "./lookup.js";
-import { adopt, servedNow } from "./registry.js";
-import { afterCall, queueReport } from "./report.js";
 import { type ResultCursor, type ResultView, resultView, viewProblem } from "./results.js";
 import { redact } from "./secrets.js";
 import {
+  boundSession,
   dropUnbound,
   loadSession,
   loggedIn,
@@ -77,6 +75,7 @@ import {
   lastHealAt,
   loadSite,
   markStale,
+  PACE_JITTER,
   RATE_COOL_MS,
   type Resolved,
   rememberedTier,
@@ -92,6 +91,13 @@ import { proofOp } from "./vet.js";
 export type Tier = 1 | 2 | 3;
 
 export interface CallOptions {
+  /**
+   * Call installed operations only: no learning/healing, registry traffic, reports, background work,
+   * or everyday-browser cookie import. Specs stay unchanged; auth and drift point to CLI commands.
+   * Keeps the transport ladder, own-profile sessions, ledger/readback and local call state.
+   * Pacing cannot be lowered below one second, including jitter.
+   */
+  callOnly?: boolean;
   /** Shape the classified, extracted answer, never the site's arguments or stored recipe. */
   view?: ResultView;
   /** required for any readOnly:false op, at every entry point */
@@ -219,6 +225,8 @@ export interface CallResult {
 type Result = Omit<CallResult, "ms">;
 
 const HEAL_GUARD_MS = 10 * 60_000;
+/** A call-only call's least interval: its shortest jittered gap between two sends is still a second. */
+const CALL_ONLY_INTERVAL_MS = 1000 / (1 - PACE_JITTER);
 // A write is retried only when the server certainly did not run it; timeouts and 5xx are ambiguous.
 const NOT_EXECUTED = new Set([400, 401, 403, 404]);
 /**
@@ -253,6 +261,16 @@ interface Ctx {
  */
 const unconfirmed = (site: Site, op: Operation) => site.shared?.by === "agent" && op.version?.status === "candidate";
 
+/**
+ * A call's starting tier and its cap. A remembered escalation is a speed hint, not a requirement:
+ * under a lower cap, the call starts at the op's own tier.
+ */
+export function callTiers(site: Site, op: Operation, maxTier: Tier = 3, remembered?: Tier) {
+  const cap = unconfirmed(site, op) ? (Math.min(maxTier, 2) as Tier) : maxTier;
+  const tier = Math.max(op.minTier, remembered !== undefined && remembered <= cap ? remembered : 1) as Tier;
+  return { tier, maxTier: cap };
+}
+
 /** The answer to a call of an `unconfirmed` op that needs tier 3. */
 const needsHuman = (site: string, notes: string[]): Result => ({
   ok: false,
@@ -267,7 +285,64 @@ const needsHuman = (site: string, notes: string[]): Result => ({
   retry: "after_fix",
 });
 
+/** The answer to a call that needs a tier above its cap; an `unconfirmed` op's tier 3 needs a human, not a cap. */
+export function tierBlocked(
+  site: Site,
+  op: Operation,
+  tiers: ReturnType<typeof callTiers>,
+  requestedMaxTier: Tier = 3,
+  notes: string[] = [],
+): Result {
+  const { tier, maxTier } = tiers;
+  if (unconfirmed(site, op) && tier === 3 && requestedMaxTier >= 3) return needsHuman(site.name, notes);
+  return {
+    ok: false,
+    class: "blocked",
+    tier,
+    reason: [...notes, `needs tier ${tier}, capped at ${maxTier}`].join("; "),
+    next: `allow a higher tier (--max-tier ${tier})`,
+    nextCall: { action: "raise_tier", tier },
+  };
+}
+
+/** Old write specs can send unbounded side effects at tier 3; call-only approval cannot cover those. */
+export function callOnlyWriteRefusal(site: string, op: Operation, tier: Tier): Result | undefined {
+  if (op.readOnly || tier !== 3) return undefined;
+  const missing = [
+    ...(op.trigger.companions === undefined ? ["no recorded companions list"] : []),
+    ...(!Object.keys(op.match).length ? ["an empty match"] : []),
+  ];
+  if (!missing.length) return undefined;
+  return {
+    ok: false,
+    class: "refused",
+    tier,
+    reason: `tier-3 write has ${missing.join(" and ")}; nothing was sent`,
+    next: `ask the user to re-learn the write with the CLI: api-anything add ${site} ${op.name} ... --write`,
+    nextCall: { action: "relearn" },
+  };
+}
+
 const NO_SESSION: Session = { cookies: [], values: {} };
+
+/** The answer when the site's session file cannot be read: nothing is sent. */
+export const badSession = (site: string, e: unknown): Result => ({
+  ok: false,
+  class: "error",
+  reason: (e as Error).message,
+  next: `delete ${sessionFile(site)}, then ask the user to run api-anything login ${site} if the site needs an account`,
+  nextCall: { action: "report" },
+  retry: "after_fix",
+});
+
+/** The answer when the args, or a session value, cannot go into the request: nothing is sent. */
+export function unsendable(site: string, op: Operation, e: unknown): Result {
+  const next =
+    e instanceof BadHeader
+      ? `nothing was sent. Check the args; if the value is the session's, ask the user to run: api-anything login ${site}`
+      : nextFor("input", site, op);
+  return { ok: false, class: "input", reason: (e as Error).message, next };
+}
 
 /**
  * Whether this op goes without the user's cookies and session values: a request that is no GET or HEAD,
@@ -276,15 +351,21 @@ const NO_SESSION: Session = { cookies: [], values: {} };
  * serves no such op to anyone but its uploader until a maintainer reviewed it (a POST read, a slot
  * holding a cookie or session ref), and the seeded POST reads need theirs (airbnb search).
  */
-function bare(ctx: Ctx, op: Operation): boolean {
+export function bareCall(site: Pick<Site, "shared">, op: Operation): boolean {
   // An unreviewed candidate is a public read by the registry's rules, so it needs no session; and a
   // GET can do harm with the user's cookies too (a one-click account action), whoever pulled it.
-  if (ctx.shared && op.version?.status === "candidate") return true;
+  if (site.shared && op.version?.status === "candidate") return true;
   // a local op's command takes only its params: nothing of the user's goes to the site
   if (op.local) return true;
-  if (ctx.shared?.by !== "agent") return false;
-  const method = op.request!.method.toUpperCase();
+  if (site.shared?.by !== "agent") return false;
+  const method = op.request.method.toUpperCase();
   return method !== "GET" && method !== "HEAD";
+}
+
+/** The session a call of `op` may send (none when `bareCall`), filtered in memory: no file is written. */
+export function callSession(site: Pick<Site, "shared">, op: Operation, session: Session, theirs = false): Session {
+  if (bareCall(site, op)) return NO_SESSION;
+  return theirs ? boundSession(session) : session;
 }
 
 /** Headers a browser computes per request about itself: Node's fetch carrying them is not Chrome's TLS. */
@@ -549,7 +630,7 @@ async function tryTier(ctx: Ctx, op: Operation, tier: Tier): Promise<Attempt> {
       ].filter(Boolean);
       return notes.length ? { ...a, note: notes.join("; ") } : a;
     }
-    const none = bare(ctx, op);
+    const none = bareCall(ctx, op);
     const session = none ? NO_SESSION : loadSession(ctx.site);
     let r: Sent | PageFetchResult;
     if (tier === 1) {
@@ -704,9 +785,12 @@ async function refreshCookies(ctx: Ctx, op: Operation, tier: Tier): Promise<bool
 }
 
 /** The version that answered in place of a drifted one worked: its report, beside the old one's failure. */
-function queueOk(hash: string, a: Attempt): void {
+async function queueOk(hash: string, a: Attempt): Promise<void> {
   try {
-    if (loadSettings().share) queueReport({ hash, outcome: "ok", tier: a.tier });
+    if (loadSettings().share) {
+      const { queueReport } = await import("./report.js");
+      queueReport({ hash, outcome: "ok", tier: a.tier });
+    }
   } catch {
     // a lost report, never a lost answer
   }
@@ -731,6 +815,15 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
       { reason: `${a.reason}; the op was learned signed in and the session has no login cookie` },
     );
   }
+
+  // Everything below sends again or heals, and a call-only call does neither.
+  if (ctx.opts.callOnly)
+    return fail(
+      a,
+      op.readOnly
+        ? { next: `ask the user to run: api-anything heal ${ctx.site} ${op.name}`, nextCall: { action: "heal" } }
+        : {},
+    );
 
   // A server that sometimes answers without the data (Google's fallback page, issue #21) answers a second
   // try: before the args are blamed or a browser heals, the same request goes once more.
@@ -783,6 +876,7 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
   // Another install may have repaired this version already, or it degraded and the registry serves the next
   // best: that version is one request, a heal is a browser run.
   if (op.readOnly && op.version) {
+    const { adopt, servedNow } = await import("./registry.js");
     const next = await servedNow(ctx.site, op).catch(() => undefined);
     // at the tier the replacement asks for, if the caller allows it: attempt() itself climbs no tier
     const tier = Math.max(a.tier, next?.minTier ?? 1) as Tier;
@@ -791,7 +885,7 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
       if (b.class === "ok") {
         adopt(ctx.site, op, next);
         ctx.opts.onAnswered?.(next);
-        queueOk(next.version.hash, b);
+        await queueOk(next.version.hash, b);
         return success(b, {
           healed: true,
           heal: { strategy: "registry", changes: templateChanges(op, next) },
@@ -883,7 +977,8 @@ async function onDrift(ctx: Ctx, site: Site, op: Operation, a: Attempt): Promise
   return fail(b, { reason: `${b.reason}; heal failed: ${h.reason}`, ...dropped(b) });
 }
 
-function resolve(
+/** The site and op a call names, from local files only, or the failure a call answers without sending. */
+export function resolveCall(
   siteName: string,
   opName: string,
 ): { site: Site; op: Operation; theirs: boolean; source: Resolved["source"] } | Result {
@@ -1112,7 +1207,7 @@ export async function call(
       retry: "after_fix",
       ms: Date.now() - t0,
     };
-  const found = resolve(siteName, opName);
+  const found = resolveCall(siteName, opName);
   if ("ok" in found) return { ...finish(found, undefined, undefined, []), ms: Date.now() - t0 };
   opts.onAnswered?.(found.op);
   return run(found.site, found.op, args, opts, { theirs: found.theirs, source: found.source }, t0);
@@ -1131,6 +1226,10 @@ async function run(
   how: { theirs: boolean; source?: Resolved["source"]; proof?: boolean },
   t0 = Date.now(),
 ): Promise<CallResult> {
+  if (opts.callOnly) {
+    const asked = opts.minIntervalMs ?? 0;
+    opts = { ...opts, minIntervalMs: Math.max(CALL_ONLY_INTERVAL_MS, Number.isFinite(asked) ? asked : 0) };
+  }
   const log: Attempt[] = [];
   const siteName = site.name;
   const { theirs, proof } = how;
@@ -1167,11 +1266,13 @@ async function run(
         ...(out.healed ? { healed: true as const } : {}),
         ...(out.write ? { write: out.write } : {}),
       });
-    if (how.source && !proof && !held)
+    if (how.source && !proof && !held && !opts.callOnly) {
+      const { afterCall } = await import("./report.js");
       afterCall(siteName, op, how.source, out, {
         fetchImpl: opts.fetchImpl,
         minIntervalMs: opts.minIntervalMs,
       });
+    }
     if (out.ok && !proof && out.data !== undefined) {
       const viewed = resultView(out.data, opts.view);
       if (viewed.truncated && out.nextPage !== undefined)
@@ -1196,29 +1297,25 @@ async function run(
   let session: Session;
   try {
     if (theirs) dropUnbound(siteName);
-    session = loadSession(siteName);
-    jar = session;
+    jar = loadSession(siteName);
+    session = callSession(site, op, jar, theirs);
   } catch (e) {
-    return done({
-      ok: false,
-      class: "error",
-      reason: (e as Error).message,
-      next: `delete ${sessionFile(siteName)}, then ask the user to run api-anything login ${siteName} if the site needs an account`,
-      nextCall: { action: "report" },
-      retry: "after_fix",
-    });
+    return done(badSession(siteName, e));
   }
   let filled: string | undefined;
   try {
     if (op.local) filled = fillTemplate(op.local.command, preparedValues(op, args));
     else buildRequest(op, args, session);
   } catch (e) {
-    const next =
-      e instanceof BadHeader
-        ? `nothing was sent. Check the args; if the value is the session's, ask the user to run: api-anything login ${siteName}`
-        : nextFor("input", siteName, op);
-    return done({ ok: false, class: "input", reason: (e as Error).message, next });
+    return done(unsendable(siteName, op, e));
   }
+  const capped = unconfirmed(site, op);
+  // a proof's op is named by a label, not one the site holds
+  const remembered = proof ? undefined : rememberedTier(siteName, op.name);
+  const tiers = callTiers(site, op, opts.maxTier, remembered);
+  let tier = tiers.tier;
+  const unsafeWrite = opts.callOnly && callOnlyWriteRefusal(siteName, op, tier);
+  if (unsafeWrite) return done(unsafeWrite);
   // A site that said stop is not asked again until its wait is over: before the write's ledger, as nothing is sent.
   held = opts.ignoreCoolDown ? undefined : cooling(siteName);
   if (held) return done(cooled(held, siteName));
@@ -1228,6 +1325,8 @@ async function run(
   let signIn: { text: string; step: NextCall } | undefined;
   const reimport = async () => {
     authStep = 1;
+    if (opts.callOnly) return false;
+    const { reimportIfBrowser } = await import("./login.js");
     const r = await reimportIfBrowser(siteName, op.request?.url ?? site.baseUrl, site.loginCookies);
     signIn =
       r.signIn && r.profile ? { text: r.signIn, step: { action: "sign_in_browser", profile: r.profile } } : undefined;
@@ -1304,38 +1403,23 @@ async function run(
       return false;
     }
   };
-  const capped = unconfirmed(site, op);
   const ctx: Ctx = {
     site: siteName,
     args,
     opts,
-    maxTier: capped ? (Math.min(opts.maxTier ?? 3, 2) as Tier) : (opts.maxTier ?? 3),
+    maxTier: tiers.maxTier,
     log,
     shared: site.shared,
     unconfirmed: capped,
     gen,
   };
-  // a proof's op is named by a label, not one the site holds
-  const remembered = proof ? undefined : rememberedTier(siteName, op.name);
-  // A remembered escalation is a speed hint, not a requirement: under a lower cap, start at the op's own tier.
-  let tier = Math.max(op.minTier, remembered !== undefined && remembered <= ctx.maxTier ? remembered : 1) as Tier;
   // Why a call ran above tier 1, so a slow call explains itself.
   const notes: string[] = tier > op.minTier ? [`started at tier ${tier}: an earlier call escalated there`] : [];
   const noted = (a: Attempt) => success(a, notes.length ? { reason: notes.join("; ") } : {});
   let examplesChecked = false;
   let plainTried = false;
   for (;;) {
-    if (tier > ctx.maxTier) {
-      if (capped && tier === 3 && (opts.maxTier ?? 3) >= 3) return done(needsHuman(siteName, notes));
-      return done({
-        ok: false,
-        class: "blocked",
-        tier,
-        reason: [...notes, `needs tier ${tier}, capped at ${ctx.maxTier}`].join("; "),
-        next: `allow a higher tier (--max-tier ${tier})`,
-        nextCall: { action: "raise_tier", tier },
-      });
-    }
+    if (tier > ctx.maxTier) return done(tierBlocked(site, op, { tier, maxTier: ctx.maxTier }, opts.maxTier, notes));
     if (tier > 1 && !browserAvailable()) {
       return done({
         ok: false,
@@ -1365,7 +1449,8 @@ async function run(
         ...stepOf(x),
         ...(x.server ? { server: true as const } : {}),
       });
-    if (write && !notRun(a)) return fail();
+    // Approval covers this transport and session, not a retry in another profile or with refreshed cookies.
+    if (write && (opts.callOnly || !notRun(a))) return fail();
     // Plain HTTP refused a read from a site with no login on record. Some walls refuse a client that
     // claims to be Chrome without Chrome's TLS (Hacker News's 419 "Sorry"): the same request goes once
     // more without the browser's identity headers, before any recovery or browser. Nothing is kept, so
@@ -1386,7 +1471,7 @@ async function run(
     }
     // A bare 403 is a wall or a refusal of this one entity (a private profile): if the example args
     // answer through the same tier, the args are the problem, and a browser run would not help.
-    if (a.class === "blocked" && a.missing && !write && !examplesChecked) {
+    if (a.class === "blocked" && a.missing && !write && !examplesChecked && !opts.callOnly) {
       examplesChecked = true;
       const examples = exampleArgs(op);
       if (
@@ -1474,7 +1559,7 @@ async function run(
     }
     // A credential marked public (a web app's shared bearer) answers auth when the site rotated it,
     // which no login fixes: re-learn it from the page, as for drift.
-    if (a.class === "auth" && op.readOnly && op.public?.length && noLogin() && !proof)
+    if (a.class === "auth" && op.readOnly && op.public?.length && noLogin() && !proof && !opts.callOnly)
       return done(await onDrift(ctx, site, op, { ...a, class: "drift" }));
     return fail();
   }
@@ -1503,7 +1588,15 @@ export async function heal(
       ms: Date.now() - t0,
     };
   };
-  const found = resolve(siteName, opName);
+  if (opts.callOnly)
+    return done({
+      ok: false,
+      class: "refused",
+      reason: "callOnly does not heal operations",
+      next: `ask the user to run: api-anything heal ${siteName} ${opName}`,
+      nextCall: { action: "heal" },
+    });
+  const found = resolveCall(siteName, opName);
   if ("ok" in found) return done(found);
   const { site, op, theirs } = found;
   resolved = op;
@@ -1524,7 +1617,7 @@ export async function heal(
     site: siteName,
     args,
     opts,
-    maxTier: capped ? (Math.min(opts.maxTier ?? 3, 2) as Tier) : (opts.maxTier ?? 3),
+    maxTier: callTiers(site, op, opts.maxTier).maxTier,
     log,
     shared: site.shared,
     unconfirmed: capped,
