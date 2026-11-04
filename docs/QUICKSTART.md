@@ -21,7 +21,7 @@ it finds:
 | Codex | `codex mcp add api-anything -- npx -y api-anything mcp`, else `~/.codex/config.toml` `[mcp_servers.api-anything]` | `~/.agents/skills/api-anything/` |
 | Cursor | `~/.cursor/mcp.json` `mcpServers` | `~/.agents/skills/api-anything/` |
 | Claude Desktop | `claude_desktop_config.json` `mcpServers` (macOS: `~/Library/Application Support/Claude/`, Linux: `~/.config/Claude/`, Windows: `%APPDATA%\Claude\`) | none: it takes skills only as an upload in its settings |
-| Hermes | its home's `config.yaml`, the top-level `mcp_servers` block (home: `$HERMES_HOME`, else `~/.hermes`) | `~/.hermes/skills/api-anything/` |
+| Hermes | its home's `config.yaml`, the top-level `mcp_servers` block (home: `$HERMES_HOME`, else `~/.hermes`); edited only in the plain 2-space form, else the entry is printed to add by hand | `~/.hermes/skills/api-anything/` |
 | Gemini CLI | `gemini mcp add --scope user api-anything npx -- -y api-anything mcp`, else `~/.gemini/settings.json` `mcpServers` | `~/.agents/skills/api-anything/` |
 | VS Code | `code --add-mcp '{...}'`, else the user `mcp.json` `servers` (macOS: `~/Library/Application Support/Code/User/`, Linux: `~/.config/Code/User/`, Windows: `%APPDATA%\Code\User\`) | `~/.agents/skills/api-anything/` |
 
@@ -122,18 +122,19 @@ api-anything learn 'https://lobste.rs/domains/{domain}' \
 ## Other clients and flags
 
 `setup` covers Claude Code, Codex, Cursor, Claude Desktop, Hermes, Gemini CLI and VS Code. For any
-other client, or when a client can't find `api-anything` or `node`, print its entry with absolute paths:
+other client, or when a client can't find `api-anything` or `node`, print its entry with absolute
+paths:
 
 ```sh
 api-anything mcp --print-config
 ```
 
-It prints the add command for Claude Code, Codex, Gemini CLI and VS Code, the JSON entry for Cursor and
-Claude Desktop, and the YAML entry for Hermes, all pointing at the absolute path of the `node` you ran it
-with and of the installed CLI. Pass the flags you want served (`--allow-writes`, `--sites goodreads`) and it adds
-them. A client started from the Dock or a menu may not get your shell's `PATH`, so a bare
-`api-anything`, or a `node` installed with nvm, is not found there. `API_ANYTHING_HOME` and
-`API_ANYTHING_BROWSER` are copied into the entry when you have them set.
+It prints the add command for Claude Code, Codex, Gemini CLI and VS Code, the JSON entry for Cursor
+and Claude Desktop, and the mcp_servers entry for Hermes, all pointing at the absolute path of the
+`node` you ran it with and of the installed CLI. Pass the flags you want served (`--allow-writes`,
+`--sites goodreads`) and it adds them. A client started from the Dock or a menu may not get your
+shell's `PATH`, so a bare `api-anything`, or a `node` installed with nvm, is not found there.
+`API_ANYTHING_HOME` and `API_ANYTHING_BROWSER` are copied into the entry when you have them set.
 
 In Claude Code, the repository also installs as a plugin (the MCP server and the skill, without
 setup's other steps): `/plugin marketplace add goodnight000/api-anything`, then

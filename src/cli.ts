@@ -330,18 +330,18 @@ const HELP: Record<string, string> = {
   --sites a,b     also serve each operation of these sites as a tool of its own (goodreads__searchBooks),
                   with its args' JSON Schema: no list_operations step first. Costs tokens per op
   --print-config  print the command or config entry that adds this server to Claude Code, Codex,
-                  Gemini CLI, VS Code, Cursor, Claude Desktop and Hermes, with absolute paths and
-                  the other flags given, instead of serving
+                  Gemini CLI, VS Code, Cursor and Claude Desktop, with absolute paths and the other
+                  flags given, instead of serving
   --no-learn      hide learn_site`,
   setup: `api-anything setup [--yes | --no-share] [--share-only] [--agents claude-code,codex,cursor,claude-desktop,hermes,gemini,vscode] [--dry-run]
   Connects the MCP server (npx -y api-anything mcp) to each agent found on this machine: Claude Code,
   Codex, Cursor, Claude Desktop, Hermes, Gemini CLI, VS Code. Installs the skill for Claude Code
   (~/.claude/skills), for Hermes (~/.hermes/skills) and for Codex, Cursor, Gemini CLI and VS Code
-  (~/.agents/skills); Claude Desktop takes skills only by upload. Checks for a Chromium browser, makes this install's key, and asks whether
-  to help build the shared catalog (default yes). Other entries in an agent's config are never changed;
-  a file is backed up to <file>.bak-api-anything before its first edit. Running it again changes
-  nothing. Afterwards, any command (the MCP server included) updates a skill copy setup installed when a
-  newer api-anything runs, unless the copy was edited.
+  (~/.agents/skills); Claude Desktop takes skills only by upload. Checks for a Chromium browser, makes
+  this install's key, and asks whether to help build the shared catalog (default yes). Other entries
+  in an agent's config are never changed; a file is backed up to <file>.bak-api-anything before its
+  first edit. Running it again changes nothing. Afterwards, any command (the MCP server included)
+  updates a skill copy setup installed when a newer api-anything runs, unless the copy was edited.
   --yes        share: answer the question yes without asking
   --no-share   do not share; answer the question no
   --share-only record --yes or --no-share and nothing else: no agent, skill or key is touched. learn_site
@@ -1006,7 +1006,7 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
     site,
     op: op.name,
     ...(r.replaced ? { replaced: true } : {}),
-    request: `${op.request!.method} ${op.request!.url.split("?")[0]}`,
+    request: `${op.request.method} ${op.request.url.split("?")[0]}`,
     params: op.params.map((p) => `${p.name}:${p.type}`),
     readOnly: op.readOnly,
     minTier: op.minTier,
@@ -1430,8 +1430,7 @@ function cmdOps({ pos, v }: Parsed): number {
         : {}),
       ...(o.readback ? { readback: readbackName(o.readback) } : {}),
       ...(o.unproven ? { unproven: o.unproven.reason } : {}),
-      ...(o.local ? { local: o.local.command } : {}),
-      ...(o.trigger ? { trigger: o.trigger.url } : {}),
+      trigger: o.trigger.url,
     })),
     ...(site.shared ? { shared: SHARED_NOTE } : {}),
     ...(notes ? { notes } : {}),

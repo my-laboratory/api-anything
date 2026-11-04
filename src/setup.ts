@@ -63,10 +63,9 @@ const SKILL_DIR: Partial<Record<Agent, () => string>> = {
   "claude-code": paths.claudeSkill,
   codex: paths.agentsSkill,
   cursor: paths.agentsSkill,
+  hermes: paths.hermesSkill,
   gemini: paths.agentsSkill,
   vscode: paths.agentsSkill,
-  // Hermes's personal skills live under its own home, not the shared book
-  hermes: () => dirname(paths.hermesSkill()),
 };
 
 /** Whether `cmd` is an executable on PATH. */
@@ -108,8 +107,8 @@ export function detect(): Agent[] {
   return AGENTS.filter((a) => seen[a]);
 }
 
-/** `added`: connected now. `unchanged`: already exactly this. `kept`: another api-anything entry is there, left as it is. */
-type Status = "added" | "unchanged" | "kept" | "would add" | "failed";
+/** `added`: connected now. `unchanged`: already exactly this. `kept`: another api-anything entry is there, left as it is. `printed`: the config can't be edited, the entry is printed for a person to add. */
+type Status = "added" | "unchanged" | "kept" | "would add" | "printed" | "failed";
 
 export interface AgentResult {
   agent: Agent;
@@ -297,6 +296,37 @@ function hermesEntry(text: string): { command?: string; args?: unknown } | undef
 }
 
 /**
+ * Whether setup may add to a Hermes config's top-level `mcp_servers:`: a plain block, where nothing
+ * but an optional comment follows the colon and the servers sit two spaces in. Deeper indentation or
+ * an inline `{...}` is a file setup can't touch without risk; an empty block is plain.
+ */
+function plainServers(text: string): boolean {
+  const m = /^mcp_servers\s*:([^\n]*)$/m.exec(text);
+  if (!m) return true;
+  if (m[1].trim() && !m[1].trim().startsWith("#")) return false;
+  for (const line of text.slice(m.index + m[0].length).split("\n")) {
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
+    return /^ {2}\S/.test(line);
+  }
+  return true;
+}
+
+/** The entry as the lines a person pastes into the plain block, the way `--print-config` prints it. */
+function hermesEntryLines(e: Entry): string[] {
+  const lines = [
+    `  ${NAME}:`,
+    "    enabled: true",
+    `    command: ${JSON.stringify(e.command)}`,
+    `    args: ${JSON.stringify(e.args)}`,
+  ];
+  if (e.env) {
+    lines.push("    env:");
+    for (const [k, v] of Object.entries(e.env)) lines.push(`      ${k}: ${JSON.stringify(v)}`);
+  }
+  return lines;
+}
+
+/**
  * Hermes launches its MCP servers from its gateway, a background process, so the entry uses npx by
  * absolute path with node's directory on PATH, like the GUI apps. Written to config.yaml rather than
  * via the hermes CLI: the gateway reads the file at startup, so editing it never touches a running
@@ -314,19 +344,12 @@ function hermesServer(dryRun: boolean): AgentResult {
       file,
       ...(same(cur, entry) ? {} : { entry: cur }),
     };
+  if (!plainServers(text))
+    return { agent: "hermes", mcp: "printed", via: "file", file, entry: hermesEntryLines(entry).join("\n") };
   if (dryRun) return { agent: "hermes", mcp: "would add", via: "file", file };
   const saved = backup(file);
   mkdirSync(dirname(file), { recursive: true });
-  const lines = [
-    `  ${NAME}:`,
-    "    enabled: true",
-    `    command: ${JSON.stringify(entry.command)}`,
-    `    args: ${JSON.stringify(entry.args)}`,
-  ];
-  if (entry.env) {
-    lines.push("    env:");
-    for (const [k, v] of Object.entries(entry.env)) lines.push(`      ${k}: ${JSON.stringify(v)}`);
-  }
+  const lines = hermesEntryLines(entry);
   const block = /^mcp_servers\s*:[ \t]*(?:#.*)?$/m.exec(text);
   let next: string;
   if (block) {
@@ -485,7 +508,12 @@ export function summary(r: SetupResult): string {
             ? "already connected"
             : a.mcp === "kept"
               ? "has another api-anything entry, left as it is"
-              : `not connected: ${a.error}`;
+              : a.mcp === "printed"
+                ? `left as it is (its mcp_servers is not a plain 2-space block); add by hand:\n${String(a.entry ?? "")
+                    .split("\n")
+                    .map((l) => `        ${l}`)
+                    .join("\n")}`
+                : `not connected: ${a.error}`;
     const skill =
       a.skill && a.skill !== "unchanged"
         ? `; skill ${SKILL_DONE[a.skill]}${a.skillNote ? ` (${a.skillNote})` : ""}`
