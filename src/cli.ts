@@ -1006,7 +1006,9 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
     site,
     op: op.name,
     ...(r.replaced ? { replaced: true } : {}),
-    request: `${op.request.method} ${op.request.url.split("?")[0]}`,
+    request: op.local
+      ? `local: ${op.local.command}`
+      : `${op.request!.method} ${op.request!.url.split("?")[0]}`,
     params: op.params.map((p) => `${p.name}:${p.type}`),
     readOnly: op.readOnly,
     minTier: op.minTier,
@@ -1430,7 +1432,7 @@ function cmdOps({ pos, v }: Parsed): number {
         : {}),
       ...(o.readback ? { readback: readbackName(o.readback) } : {}),
       ...(o.unproven ? { unproven: o.unproven.reason } : {}),
-      trigger: o.trigger.url,
+      ...(o.trigger ? { trigger: o.trigger.url } : {}),
     })),
     ...(site.shared ? { shared: SHARED_NOTE } : {}),
     ...(notes ? { notes } : {}),
