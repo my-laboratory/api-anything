@@ -1006,9 +1006,7 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
     site,
     op: op.name,
     ...(r.replaced ? { replaced: true } : {}),
-    request: op.local
-      ? `local: ${op.local.command}`
-      : `${op.request!.method} ${op.request!.url.split("?")[0]}`,
+    request: op.local ? `local: ${op.local.command}` : `${op.request!.method} ${op.request!.url.split("?")[0]}`,
     params: op.params.map((p) => `${p.name}:${p.type}`),
     readOnly: op.readOnly,
     minTier: op.minTier,
