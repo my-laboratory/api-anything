@@ -21,6 +21,8 @@ export interface SiteRow {
   display_name: string | null;
   description: string | null;
   login_cookies: string | null;
+  /** the site's budget as JSON (SiteContext.pace) */
+  pace: string | null;
   notes: string | null;
   first_uploader: string;
 }
@@ -69,6 +71,7 @@ export const context = (r: SiteRow): SiteContext => ({
   ...(r.display_name ? { displayName: r.display_name } : {}),
   ...(r.description ? { description: r.description } : {}),
   ...(r.login_cookies ? { loginCookies: JSON.parse(r.login_cookies) as string[] } : {}),
+  ...(r.pace ? { pace: JSON.parse(r.pace) as NonNullable<SiteContext["pace"]> } : {}),
   ...(r.notes ? { notes: r.notes } : {}),
 });
 
@@ -85,13 +88,14 @@ const siteValues = (s: SiteContext, uploader: string, now: string) => [
   s.displayName ?? null,
   s.description ?? null,
   s.loginCookies ? JSON.stringify(s.loginCookies) : null,
+  s.pace && Object.keys(s.pace).length ? JSON.stringify(s.pace) : null,
   s.notes ?? null,
   uploader,
   now,
   now,
 ];
 const SITE_COLUMNS =
-  "(name, domain, base_url, display_name, description, login_cookies, notes, first_uploader, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  "(name, domain, base_url, display_name, description, login_cookies, pace, notes, first_uploader, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 /** The first upload binds the name to its domain and sets the site's context; later ones leave it. */
 export const addSite = (db: D1Database, s: SiteContext, uploader: string, now: string) =>
@@ -104,7 +108,7 @@ export const addSite = (db: D1Database, s: SiteContext, uploader: string, now: s
 export const seedSite = (db: D1Database, s: SiteContext, now: string) =>
   db
     .prepare(
-      `INSERT INTO sites ${SITE_COLUMNS} ON CONFLICT (name) DO UPDATE SET domain = excluded.domain, base_url = excluded.base_url, display_name = excluded.display_name, description = excluded.description, login_cookies = excluded.login_cookies, notes = excluded.notes, updated_at = excluded.updated_at`,
+      `INSERT INTO sites ${SITE_COLUMNS} ON CONFLICT (name) DO UPDATE SET domain = excluded.domain, base_url = excluded.base_url, display_name = excluded.display_name, description = excluded.description, login_cookies = excluded.login_cookies, pace = excluded.pace, notes = excluded.notes, updated_at = excluded.updated_at`,
     )
     .bind(...siteValues(s, "seed", now))
     .run();
@@ -414,13 +418,18 @@ export async function count(db: D1Database, subject: string, kind: string, hour:
   return row?.n ?? n;
 }
 
-export const touchKey = (db: D1Database, key: string, now: string, uploads: number, reports: number) =>
+/** Counts a key's uploads and reports; `ok`: an ok report of it was accepted, which sets `activated_at` once. */
+export const touchKey = (db: D1Database, key: string, now: string, uploads: number, reports: number, ok = false) =>
   db
     .prepare(
-      "INSERT INTO keys (key, first_seen, uploads, reports) VALUES (?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET uploads = uploads + excluded.uploads, reports = reports + excluded.reports",
+      "INSERT INTO keys (key, first_seen, uploads, reports, activated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT (key) DO UPDATE SET uploads = uploads + excluded.uploads, reports = reports + excluded.reports, activated_at = COALESCE(keys.activated_at, excluded.activated_at)",
     )
-    .bind(key, now, uploads, reports)
+    .bind(key, now, uploads, reports, ok ? now : null)
     .run();
+
+/** Sets an existing key's `activated_at`, unless it is set already. */
+export const activateKey = (db: D1Database, key: string, now: string) =>
+  db.prepare("UPDATE keys SET activated_at = ? WHERE key = ? AND activated_at IS NULL").bind(now, key);
 
 /** Every version that could still be served, with what the archive decision reads. */
 export async function archiveCandidates(db: D1Database): Promise<(Archivable & { hash: string })[]> {

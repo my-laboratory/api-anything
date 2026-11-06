@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { closeBrowser, closeIdleBrowser } from "./browser.js";
+import { closeIdleBrowser } from "./browser.js";
 import { setAt, templateRefs } from "./codec.js";
 import { describeOperation, type OperationDescription } from "./describe.js";
 import { siteOf } from "./domain.js";
@@ -28,6 +28,7 @@ import {
 import { fillTrigger } from "./heal.js";
 import { buildRequest, filledValues, unknownArgs, withDefaults } from "./http.js";
 import { profileSignedIn } from "./profile-state.js";
+import { callResultSchema, type JsonSchema, opDataSchema } from "./schema.js";
 import { captureLive, redact } from "./secrets.js";
 import { accountCookies, home, loadSession, placeholders, type Session } from "./session.js";
 import type { Operation, Request, Site, Trigger } from "./spec.js";
@@ -79,12 +80,30 @@ export type CallPlan =
 type ReadyPlan = Extract<CallPlan, { ok: true }>;
 
 /**
- * Host controls transport, write permission and the answer's shape (`view`), never healing, force or
- * duplicate overrides. `view` shapes only the answer, so it is not part of the approved plan.
+ * An op's description, with `resultSchema` beside `params`: a JSON Schema describing the CallResult
+ * of a call of the stored recipe, its whole answer rather than a `view.fields` projection of it.
+ * Descriptive, not a contract: nothing validates an answer against it, and `data` follows the spec
+ * as it is when the call runs, which a heal or a re-add can change.
+ */
+export type HostOperationDescription = OperationDescription & { resultSchema?: JsonSchema };
+
+/**
+ * Host controls transport, write permission and the answer's shape (`view`; a read's `maxAgeMs` and
+ * `changes`), never healing, force or duplicate overrides. Those shape only the answer, so they are
+ * not part of the approved plan.
  */
 export type HostCallOptions = Pick<
   CallOptions,
-  "allowWrites" | "maxTier" | "timeoutMs" | "fetchImpl" | "minIntervalMs" | "view"
+  | "allowWrites"
+  | "maxTier"
+  | "timeoutMs"
+  | "fetchImpl"
+  | "minIntervalMs"
+  | "view"
+  | "maxAgeMs"
+  | "changes"
+  | "changesOnly"
+  | "watch"
 >;
 export type HostPlanOptions = Pick<CallOptions, "maxTier">;
 
@@ -267,14 +286,17 @@ export function hostSites(): HostSite[] {
 /** Describe one installed site and its caller notes, without pulling, calling or opening a browser. */
 export function hostSite(
   name: string,
-): { site: HostSite; notes?: string; operations: OperationDescription[] } | undefined {
+): { site: HostSite; notes?: string; operations: HostOperationDescription[] } | undefined {
   const r = loadSite(name);
   if (!r) return undefined;
   const notes = siteNotes(r.site.name);
   return {
     site: summary(r, loginDomains()),
     ...(notes ? { notes } : {}),
-    operations: r.site.operations.map((op) => describeOperation(r.site, op.name)),
+    operations: r.site.operations.map((op) => ({
+      ...describeOperation(r.site, op.name),
+      resultSchema: callResultSchema(opDataSchema(op)),
+    })),
   };
 }
 
@@ -471,6 +493,10 @@ export async function callPlanned(plan: ReadyPlan, opts: HostCallOptions = {}): 
       fetchImpl: opts.fetchImpl,
       minIntervalMs: opts.minIntervalMs,
       ...(opts.view ? { view: opts.view } : {}),
+      ...(opts.maxAgeMs !== undefined ? { maxAgeMs: opts.maxAgeMs } : {}),
+      ...(opts.changes ? { changes: true } : {}),
+      ...(opts.changesOnly ? { changesOnly: true } : {}),
+      ...(opts.watch !== undefined ? { watch: opts.watch } : {}),
       callOnly: true,
     });
   } finally {
@@ -479,7 +505,11 @@ export async function callPlanned(plan: ReadyPlan, opts: HostCallOptions = {}): 
   }
 }
 
-/** Close the shared browser so the process can exit. Host calls never queue background work. */
+/**
+ * Let the process exit: `shutdown` (any background registry work this process started outside host
+ * calls, bounded, then the shared browser). Host calls themselves never queue background work.
+ */
 export async function closeHost(): Promise<void> {
-  await closeBrowser();
+  const { shutdown } = await import("./report.js");
+  await shutdown();
 }

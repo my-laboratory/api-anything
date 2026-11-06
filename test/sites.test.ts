@@ -9,7 +9,7 @@ import { judge } from "../src/classify.js";
 import { asText, fillTemplate, getAt } from "../src/codec.js";
 import { call } from "../src/execute.js";
 import { returnedFields } from "../src/extract.js";
-import { buildRequest, holdsRef, preparedValues } from "../src/http.js";
+import { buildRequest, holdsRef, requestArgs } from "../src/http.js";
 import { personalIn } from "../src/publish.js";
 import { providerKeys, scanSecrets } from "../src/secrets.js";
 import { type Operation, parseSite, type Site } from "../src/spec.js";
@@ -104,7 +104,7 @@ test("recorded answers: each fixture's args reach their slots, and its recipe fi
         }
       } else {
         // a local op's args fill its command: fill it and find every one
-        const cmd = fillTemplate(o.local!.command, preparedValues(o, f.args));
+        const cmd = fillTemplate(o.local!.command, requestArgs(o, f.args));
         for (const [k, v] of Object.entries(f.args))
           assert.ok(cmd.includes(asText(v)), `${at}: ${k} not in its command`);
       }
@@ -363,7 +363,7 @@ test("youtube search with the ad layout (VISITOR_INFO1_LIVE set) still returns e
 
 test("youtube captions: the local command carries the args, and its WebVTT comes back as text", () => {
   const o = op("youtube", "captions");
-  const cmd = fillTemplate(o.local!.command, preparedValues(o, { id: "jNQXAC9IVRw" }));
+  const cmd = fillTemplate(o.local!.command, requestArgs(o, { id: "jNQXAC9IVRw" }));
   assert.ok(o.local!.command.includes("yt-dlp"), "captions is a local op");
   assert.ok(cmd.includes("'{id}'") === false && cmd.includes("'jNQXAC9IVRw'"), "the id fills the command");
   assert.ok(cmd.includes("'en'"), "the default language is en");

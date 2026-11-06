@@ -21,16 +21,19 @@ holds the evidence behind it, including the api-anything bugs that must not come
 | `src/browser.ts` | Chrome via playwright-core: trigger capture, tier 2 page fetch, login |
 | `src/heal.ts` | add, rescan, recapture, tier-3 trigger runs, captures |
 | `src/execute.ts` | `call()`: the tier ladder, classifier actions, heal guards, write rules |
+| `src/seal.ts` | AES-256-GCM sealing of session and capture files; the data key from the OS store or `API_ANYTHING_KEY`; the no-key fallback |
 | `src/session.ts`, `src/store.ts` | `~/.api-anything`: cookie jar, specs, heal log, state, write ledger, call log, export |
 | `src/status.ts` | `status`: each op's health from the local files only, each problem with its `next` |
 | `src/checks.ts` | `verify`: run each read's example and checks, judge pass/fail/inconclusive, keep the record `publish` gates on |
 | `src/vet.ts` | the shared rules a spec someone else wrote must pass: on pull, publish, load and in CI |
 | `src/registry.ts` | the registry service's client (`docs/REGISTRY.md`, wire contract `src/registry-api.ts`): `pull`, `search`, the bundled upgrade |
 | `src/publish.ts`, `src/share.ts` | what an upload sends and the scans before it (`publish` previews it); `shareOps` sends what the rules allow, signed; the heal-back |
-| `src/report.ts`, `src/background.ts` | reports of calls of registry versions, in the background; an idle MCP server's verification of candidates |
+| `src/report.ts`, `src/background.ts` | reports of calls of registry versions, in the background, and `shutdown` (a library caller's bounded wait for them); an idle MCP server's verification of candidates |
+| `src/snapshots.ts`, `src/changes.ts`, `src/budget.ts` | a read's cache entry and watchers' baselines (keyed by args and session, never naming either); what changed between two answers; a site's request budget |
 | `src/registry-api.ts` | the wire contract with the registry service: endpoints' types, request signing, version hashing |
 | `src/search.ts`, `src/domain.ts` | pure pieces the registry service shares: an op's summary, the index entry, query scoring; host to site |
 | `src/identity.ts` | the install's Ed25519 key, signed request headers, and `settings.json` (whether to share) |
+| `src/schema.ts` | JSON Schemas of the answers: a call's result, an op's data, each MCP tool's `outputSchema`; permissive, since a mismatch breaks the call |
 | `src/clean.ts` | a call with no cookies or session values, over plain HTTP: whether an op is public |
 | `src/learnsite.ts` | `learn_site`: add's two runs with the user's args, the pick from the outline, a holdout call, a clean replay, then share |
 | `src/setup.ts` | `setup`: connect the MCP server and the skill to each agent, the key, the one question |
@@ -38,6 +41,7 @@ holds the evidence behind it, including the api-anything bugs that must not come
 | `src/login.ts`, `src/import.ts` | sign in by importing the everyday browser's cookies; re-import on `auth` |
 | `src/cli.ts`, `src/mcp.ts`, `src/mcp-learn.ts`, `src/index.ts`, `src/host.ts` | entry points; `mcp-learn.ts` is the MCP `learn_site` tool; `host.ts` is `api-anything/host`, call-only (docs/HOST.md) |
 | `src/profile-state.ts`, `src/sqlite.ts` | whether api-anything's own Chrome profile may hold a site's sign-in: a cookie name not known to be anonymous, offline; node:sqlite opened read-only |
+| `src/serve.ts`, `src/openapi.ts` | `serve`: MCP over HTTP, REST endpoints that run the MCP tools' own handlers (`createToolset`), the token, Origin and Host guards; the OpenAPI 3.1 document (docs/SERVE.md) |
 | `src/jobs.ts` | an MCP call still running at its deadline answers with a job; identical calls join it |
 | `src/clients.ts` | `mcp --print-config`: how each MCP client adds the server, with absolute paths |
 | `registry/` | the registry service: a Cloudflare Worker with D1 (docs/REGISTRY.md) |

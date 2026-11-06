@@ -802,6 +802,38 @@ option `ignoreCoolDown` (CLI `call --force`), which only a user asks for, sends 
 it: one that succeeds ends it, since the site answered (before a write's readback, which may set it
 again); one the site limits or blocks again sets it anew from that answer, as any call does. MCP has no way to skip it. The idle MCP server's verification of candidates skips a cooling site too.
 
+**A site's budget** (`budget.ts`). Pacing and cool-downs keep one burst polite and leave a site alone
+once it says stop. A scheduled caller (cron every 10 minutes, five fare searches each) never bursts
+and never hears stop until the wall comes: Google serves its anti-bot page after about 50 automated
+requests (issue #84). So a site may carry a budget, `pace: {minIntervalMs?, perHour?}` in its spec,
+which `API_ANYTHING_PACE` overrides: entries `interval=<duration>` (at most 1h) and `perHour=<n>` (1
+to 3600) for every site, or prefixed `<site>:` for one (its own entry wins), with 0 turning either
+off. An entry that does not parse makes every call `error`, saying so, rather than run unbudgeted;
+that is the user's own setting, so it is reported to nobody. No bundled site has one, so nothing is
+slower by default. `minIntervalMs` replaces the 1 s default pacing interval when larger (a caller's
+own `minIntervalMs` cannot go below it). A spec's `perHour` is a whole number from 1 to 3600 and its
+`minIntervalMs` at most an hour (spec.ts), so the count kept is never shorter than the cap.
+
+The budget is held at every request a call actually sends: tier 1 and each lookup, a tier-2 fetch
+(and its resend after the page navigated), a tier-3 run, and every retry inside the call (the
+plain-HTTP retry, an auth recovery's retry, the tier-2 try after tier 1). Each one's send slot
+(`store.ts` `reserveSend`) checks the budget, takes the slot and counts the send in one step under
+pace.json's lock, the counts kept in `sends.json` for the last hour (only while a cap applies), so
+concurrent calls and separate processes can never both take the hour's last request. A send whose
+site has used its `perHour` this hour, or whose slot is more than 10 s off under any budget, is not
+sent and reserves nothing: the call answers `rate` with `budget: true`, `retryAfterMs` (until the
+oldest counted send leaves the hour, or until the slot) and a `reason` naming the budget. Callers
+past the budget are told to come back rather than queued. A call also checks once before anything
+(after the cool-down, before a write's ledger), so a refused write says `write: "not_sent"`; a send
+refused later in a call leaves the write status what its earlier attempts made it. A refusal sets no
+cool-down and reports nothing to the registry, since the site said nothing. A cached answer
+(Watching, under Response extraction) spends none of it. `--force` does not lift it: the user's own
+environment does. A write's readback (inline or named) is part of the write the user asked for: its
+sends are counted, never refused. The shared rules bound a spec's `pace` so that someone else's
+spec cannot make a site unusable: `minIntervalMs` from 1 s to 60 s, `perHour` from 1 to 1000; the
+user's `API_ANYTHING_PACE` (`<site>:perHour=0`) lifts a shared one. `pace` travels with the site's
+context to the registry and back (REGISTRY.md). `ops` and `list_operations` show it.
+
 | tier | transport | when |
 |---|---|---|
 | 1 | Node `fetch` + domain/path-scoped cookie jar + session values; redirects followed by hand under the redirect policy below (cookies set on a hop ride on the next); Set-Cookie answers are merged into the jar; the body is decoded with its declared charset | default |
@@ -954,7 +986,8 @@ An op is `degraded` when its last 24 h ran mostly at a higher tier than the 6 da
 an ok rate 20 points lower (3 calls in each window at least: fewer say nothing). Each problem
 carries `next`, phrased as a call's is. A read remembered above its own `minTier` is called once
 with `--max-tier` at that tier. That needs no new mechanism: an answer at the op's own tier already
-forgets the escalation.
+forgets the escalation. It also carries `storage`, whether credential files are sealed here, and a
+`plaintext` problem for each session file left unsealed with no key ("Sealed files").
 At tier 2 `timeoutMs` is one deadline for the whole call, counted from the moment Chrome is up
 (starting it, seconds on a busy machine, is not counted): the first load of the origin page, every
 hop of the fetch, and the wait and second fetch after the page navigated all draw on it. When the
@@ -1045,7 +1078,7 @@ send a request again (its own scripts, a retry after a navigation or a connectio
 - A browser locks a profile to one process. The browser is released after 3 s idle, and a second
   process waits up to 15 s for the profile before it fails with a short hint. SIGTERM exits.
 - After every browser run, cookies are exported (full Playwright cookie objects) to
-  `~/.api-anything/sessions/<site>.json`, together with session values seen in captured headers and what a learn
+  `~/.api-anything/sessions/<site>.json` (sealed: see "Sealed files"), together with session values seen in captured headers and what a learn
   classified each of them as, a setting or a credential. A later run that only refreshes the values classifies
   nothing: a setting whose value changed is unclassified again, and a credential stays one. Every write of the file
   goes through one place, which records there what the save-time scan keeps and returns that, so no write undoes
@@ -1121,6 +1154,62 @@ the page. For data embedded in the HTML document (for example Google's `AF_initD
 "embedded"` with a regex whose capture group is JSON, followed by `extract`. Seroval/JS-literal
 payloads are out of scope for v1.
 
+**Watching: a cache and what changed** (`snapshots.ts`, `changes.ts`). We do not schedule: cron and
+agent hosts do that. A scheduled read needs two things from a call, and they are kept apart, in
+`~/.api-anything/snapshots/<hash>.json`: a **cache entry** (what `maxAgeMs` answers from) and each
+watcher's **baseline** (what `changes` compares with). Each holds an `ok` answer (the extracted
+answer before the call's view, with `nextPage` and `hasMore`). A file's name hashes what it is for:
+the site, the op, the args as the request takes them (`requestArgs`: defaults filled, each coerced to
+its param's type and checked, so `1`, `"1.0"` and `"01"` for a number are one; an arg no request can
+carry is refused before any lookup), the session it was answered for, and for a baseline the
+watcher's name. The session is an HMAC-SHA256, under a random salt kept in `~/.api-anything/snapshot-salt`
+(0600), of the cookies the op's request carries and the session values it fills, or `signed-out`
+when it carries none; a cookie known to carry no account (`mayCarryAccount`: analytics, bot
+management, CSRF) is left out, since several rotate on every answer. So a kept answer is only ever
+served to, or compared for, the session it was for: after a switch of account or a logout the call
+sends. The session is read before any kept answer is. No arg, cookie or value is written in a name.
+The answer can hold the user's own data: each file is 0600 in a 0700 directory, every read and write
+of one goes through a single pair of helpers (where sealing private files at rest belongs: pending,
+see the at-rest sealing of sessions and captures), and a file nobody read or wrote for 30 days is
+removed (checked at most hourly on a write). An answer over 16 MiB is not kept. Nothing is kept by
+default: a plain call writes none.
+- `maxAgeMs` (CLI `--max-age 30s|10m|2h|1d`; MCP `call_operation` and `call_batch`; the host's
+  `callPlanned`): when the cache entry is at most that old, was answered by the same effective op
+  (its request, slots, params, volatile values, trigger, match, response recipe, `minTier`, paging
+  and the site's `baseUrl`: an edit, a heal or a raised `minTier` is a miss) and at a tier the call's
+  `maxTier` allows, the call answers it with `cached: true` and `ageMs`, sending nothing, before the
+  cool-down or the budget is consulted; it is not a call of the site, so it adds no call-log line and
+  no report. Every read that sends with `maxAgeMs` or `changes` and gets an `ok` answer refreshes the
+  cache entry. Only an `ok` answer is ever kept, so a failure is never served, and a failed call
+  leaves the last ok answer in place. A write is never kept or served (each call is the user's
+  action), whatever it is passed; neither is a write's readback. A `maxAgeMs` call never moves a baseline.
+- `changes` (CLI `--changes`): the answer gains `changes`, against the baseline of the call's watcher,
+  which this answer then replaces (read, compared and written under the file's lock). `watch` (CLI
+  `--watch <name>`, MCP and host `watch`; implies `changes`) names the watcher, `default` without
+  one, so two watchers of one query each see every change. Only a `changes` call moves its own
+  watcher's baseline. A baseline kept by another response recipe is no baseline (`{first: true}`);
+  one kept from a newer answer than a cache hit is compared with and left in place. The first is
+  `{first: true}`. A list is compared item by item: `{since, added: items, removed: earlier items,
+  changed: [{key, occurrence?, item, fields, was}], unchanged: n, key}`. Items are told apart by the
+  op's declared `response.key` (a path in each item, read by the extractor's own path steps
+  `parsePath`/`getPath`, so `["seller.name"]` is a flat field and `seller.name` a nested one), else by
+  the first of `id`, `_id`, `uuid`, `guid`, `objectID`, `key`, `slug`, `url`, `link`, `href`,
+  `permalink` that every item of both answers has, each value distinct; else each item is a hash of
+  itself (`key: "hash"`: an edit is then one removed and one added). An item's identity is its kind
+  (key or hash), its value as it is (`1` and `"1"` are two) and its occurrence among items with the
+  same value, so no value can stand for another's repeat or hash. Anything else is compared by leaf
+  path (`a.b`, `["x.y"]`; a list inside is one leaf): `added: [{path, to}]`, `removed: [{path, from}]`,
+  `changed: [{path, from, to}]`. With `view.fields` both answers are projected the same way first, so
+  what is compared is what is returned, while an item's key is still read from the whole item (a view
+  without the id still matches items). The changes, their truncation note included, are capped at the
+  view's `maxChars`: the longest of the three lists loses its last entries, and `truncated` counts
+  them, saying they are not reported again. When the answer cannot be kept as the baseline (too
+  large, a home that cannot be written), the call stays `ok` and `changes` says `retained: false` with
+  a `reason`: the next call compares with the one before. `changesOnly` (CLI `--changes-only`) answers
+  `changes` with no `data` and keeps no result view, for polling at a few tokens a run; it is a read's
+  option, and a write keeps its `data`. A cached answer compared with a baseline it already is reports
+  nothing changed.
+
 A read whose list pages carries `paging: {param, next?}`. `param` is the arg that asks for the
 next page. `next` is a path in the whole answer, read before `extract` and `pick` throw the rest
 away (for `embedded`, in the embedded JSON; never for `html`), to the next page's cursor or number.
@@ -1151,7 +1240,10 @@ the two continuations are independent, and `hasMore` describes the site only.
 
 ## Spec files and where they live
 
-One JSON file per site: `{ name, displayName, baseUrl, description, operations[] }`, zod-validated.
+One JSON file per site: `{ name, displayName, baseUrl, description, pace?, operations[] }`, zod-validated
+(`pace` is the site's budget, under Execution ladder; an op's `response.key` names what tells its
+items apart for `changes`, and the shared rules require it to be a path to one value in a field the
+recipe returns).
 Site names are case-insensitive (lower-cased), so one file never gets two sets of state.
 Resolution order: `~/.api-anything/sites/<site>.json` (user-created and healed copies win) → a
 pulled `~/.api-anything/registry/<site>.json` → the bundled `sites/<site>.json` (community). A heal
@@ -1184,9 +1276,42 @@ of the service and the crowd rules (candidate, live, degraded, review; promotion
 contract is `src/registry-api.ts`. This section is the client's side. The base URL is `REGISTRY_API`;
 `API_ANYTHING_REGISTRY` overrides it (https, or http to localhost for tests). Every request refuses
 redirects, has a timeout and reads its answer while streaming up to a cap. Uploads, reports and
-verify jobs are signed with the install's Ed25519 key (`identity.ts`). Nothing is uploaded, reported
-or verified unless setup's question (`QUESTION`) was answered yes (`settings.json` `share`, with
-`askedAt`), except an upload the user consents to.
+verify jobs are signed with the install's Ed25519 key (`identity.ts`). Nothing is uploaded or reported
+unless setup's question (`QUESTION`) was answered yes (`settings.json` `share`, with `askedAt`), except
+an upload the user consents to, and nothing is verified in the background unless the second question
+(`VERIFY_QUESTION`, asked by setup only after a yes, default no) was answered yes too (`verify`, with
+`verifyAskedAt`). A no to sharing turns `verify` off with it. `settings.json` always holds `verify`
+once written by this version; a file without it was written by a version whose single question also
+covered verification, so its first read writes `verify` equal to `share` (`verifyFrom: "migrated"`)
+and later reads take the field as it is.
+
+**Local-only.** `localOnly()` is `API_ANYTHING_LOCAL_ONLY=1` or `settings.json` `localOnly`
+(`setup --local-only`; `--no-local-only` clears it). `registryRequest` is the one function that sends a
+request to the registry, and with local-only on it throws `LocalOnlyError` before it opens a connection,
+so every path is covered by that one check: search, pull, servedNow, sharedName, reports, verify jobs,
+claims, uploads, interface reports and the bundled upgrade. The callers that would otherwise ask the
+user something or record an attempt check first: `search` answers from this machine with a `localOnly`
+note, `shareOps` answers each op "local-only", `publish` refuses with that reason, `upgradeBundled`
+records no attempt, `learn_site` asks no sharing question, and a call (CLI or MCP) of a site this machine
+lacks says it is local-only and how to turn that off. `test/local-only.test.ts` points the registry at a
+localhost server that counts connections and runs each path with local-only on: none connects.
+
+**The catalog's one request to a site.** The service never calls a site for an install: every call runs
+on the user's machine, from its address and with its sessions, which is what lets the ladder reach sites
+that block datacenters. The single exception is a visitor's try (`GET /v1/try/:site/:op`,
+`registry/src/try.ts`; docs/REGISTRY.md "Trying an op from the catalog"), so that someone without Node 22
+can see what an op answers before installing. It is narrow on purpose, because each try is a request the
+catalog sends in its own name from Cloudflare's addresses: only ops in a list in the code (a few bundled
+public reads of harmless data), and only as reviewed in the repo's `sites/`, built into the Worker, never
+the version the registry serves (anyone can upload a version under an allowlisted name and get it
+promoted); only a GET at `minTier` 1 with no `cookie:`/`session:` ref, no lookup and no `public` names,
+passing `vetShared`; every request, each redirect hop included, to the op's exact origin (https, port
+443) or an origin listed beside it, at most 2 redirects; only the op's literal headers and an empty jar,
+never anything of the visitor's request; limits per network and per day, a daily total that each hop
+takes from, an 8 s timeout, a 1 MB cap, and a 10-minute cache.
+It reuses `buildRequest`, `judge` and `capOutput`, so its answer is a `CallResult` (with `via:
+"catalog-try"`). The Worker var `TRY_ENABLED` turns it off without a code change. A try reports nothing:
+it says how the site answers Cloudflare, not an install, so it counts toward no promotion.
 
 **The one question, asked once.** A plugin install, `claude mcp add` or `npm -g` never runs setup, so
 `learn_site` asks the same question the first time it reaches the share step (the holdout answered and
@@ -1495,7 +1620,7 @@ The registry counts it as a heal only after this install reported `fail` on the 
 reports (the call's `fail` among them) are flushed and awaited before the upload. Otherwise it stays a
 local op with no version.
 
-**Background verification (`background.ts`).** An MCP server with `share` on that has seen no message
+**Background verification (`background.ts`).** An MCP server with `share` and `verify` on (and not local-only) that has seen no message
 in or out for 60 s asks `GET /v1/verify-jobs` (signed) for candidates this install has not reported,
 takes each candidate's op from the job, which carries the version and its site's `baseUrl` since
 `GET /v1/sites/<site>` serves only each op's best (used only when it hashes to the job's hash; a
@@ -1503,7 +1628,7 @@ registry that sends none is asked `GET /v1/sites/<site>`, matched by hash; not i
 shared rules), calls it with the job's args through `cleanCall` with `publicOnly` (https to public
 addresses only, every hop, as above), never with the user's sessions, and reports the outcome. A
 candidate with `minTier` above 1 is skipped: plain HTTP would fail it whether it works or not, and the
-report would count against it. The calls go from the user's IP address, which the setup question says.
+report would count against it. The calls go from the user's IP address, which the verification question says.
 At most 20 a day (`~/.api-anything/verify-jobs.json`); a round stops when the client goes away.
 
 **Recorded answers (`test/fixture/sites/<site>.json`).** CI cannot reach the sites, so for every
@@ -1539,6 +1664,29 @@ the page).
 The easiest sign-in is the one the user already did. `api-anything login <site|url>` by default
 **imports** that site's cookies from the user's everyday browser, so there is no password to type
 and no 2FA/captcha to redo — the human solved those in their own browser already.
+
+**A person approves the first import.** An agent with a shell can run `api-anything login <any site>`
+itself, and on macOS the Keychain hands over the Safe Storage key without a dialog once the user has
+clicked "Always Allow", so an import nobody watched would be silent. So a browser import needs a
+person's approval of the pair it reads: the registrable domain of the URL and the browser profile.
+`importSession` enforces it, so every path does: the CLI, MCP `login`, `reimportIfBrowser` on an
+`auth` (a call's, or `learn_site`'s holdout's). The profile is chosen from plaintext cookie names
+(`chooseProfile`); for a pair with no approval, the terminal asks `Import <domain> cookies from
+<Browser profile label>? [y/N]` (`confirm`) before any value is read or decrypted, and a no keeps
+nothing (`ImportRefused`, `declined`). With no `confirm` (no terminal) and no approval for the domain
+at all, it refuses before it opens any cookie database; with one for the domain but another profile,
+before it reads a value. `--profile` does not bypass it, since an agent can pass it. Each approval is
+saved with the import, in the session's `imports` (sealed like the rest of the session), so it is
+bound to the domain, not the site key: an op of the site on another domain, or a URL passed with the
+site's name, is a new choice. A session from before `imports` whose `source` is a browser profile
+counts as approved for that profile and the registrable domain of the site's `baseUrl` (or of the
+site's name, for a site named after its host) only (`importApprovals`). `--window` and `--cookies`
+need no terminal. `API_ANYTHING_ALLOW_IMPORT=github.com,linkedin.com` pre-approves those domains
+(each host counts for its registrable domain) for headless automation the user set up.
+
+This guards against an agent importing by accident or on a page's instruction. It is not a boundary
+against an agent with unrestricted shell access, which can answer the prompt in a PTY of its own or
+set `API_ANYTHING_ALLOW_IMPORT`; the boundary there is not giving an untrusted agent a shell.
 
 A password is never a trigger step's. A `fill` step's value is saved in the spec (and its examples),
 so before it types, the run asks the page what the field is: a `type=password` input, or one whose
@@ -1633,7 +1781,97 @@ or whose literal (outside `{param}`s) is random-looking; add's save and `export`
   duplicate guard records the write, so a call that sends nothing leaves nothing for a repeat to be
   held back by. Nothing sent means the send-once rule is untouched. This check ignores `guestCookies` (see above), so a guest's write still
   reaches the server, whose 401 or 403 is retried as any write's is.
-- **`logout <site>`** clears the jar and that site's cookies in the profile.
+- **`logout <site>`** deletes the session file (it needs no key, so it also resets a sealed jar whose
+  key is lost) and clears that site's cookies in the profile.
+
+### Sealed files (`seal.ts`)
+
+Session files and captures hold live credentials, and 0600 only keeps other users out: a backup, a
+synced home folder, a stray `git add` or a lost disk carries them. So both are sealed with
+AES-256-GCM (node:crypto) under one 32-byte data key. On macOS, `login` decrypts cookies Chrome keeps
+behind the Keychain; storing them less protected than the browser did would undo that.
+
+- **What is sealed**: `sessions/<site>.json`, `captures/<id>.json` and the kept answers in
+  `snapshots/<hash>.json` (a signed-in read's answer is the user's data), through `readSealed` and
+  `writeSealed`, not through `writePrivate`, so no other file changes. A snapshot that cannot be
+  opened is a cache miss, and one that cannot be sealed is not kept (`Saved.reason`). Captures keep their values,
+  because learning reads them: `learnOrExplain` takes the capture's `cookies` and `storage` as the
+  live values (`ownSession`, `known`), `sentCookies` reads each request's `cookie` header, and add and
+  learn_site merge the run's cookies and the session values found in its headers into the jar
+  (`mergeCapture`). Nothing else under the home holds a cookie or token value: specs, the heal log,
+  `state.json`, `calls.jsonl`, `checks/`, the write ledger (digests under `write.key`) and settings
+  stay plaintext. `key.json` (the install's registry signing key) and `write.key` are secrets but not
+  logins, and sealing them would tie the install's identity to the key store; they stay 0600.
+- **Format**: a first line `#api-anything-sealed`, then
+  `{"sealed":"api-anything/1","alg":"A256GCM","key":<source>,"kid":<16 hex>,"iv","tag","data"}`.
+  The first line is deliberately not JSON. api-anything 0.3.2 and earlier read a session file with
+  `JSON.parse` and throw on anything else ("is corrupt; fix or delete it"), and every write they make
+  to a session loads it first (`logout` aside), so an older version that meets a sealed home refuses
+  it loudly. A JSON envelope would have read there as an empty session, and the next save would have
+  replaced the sealed jar with plaintext. The version marker lets a later format be told apart. An
+  unknown or malformed marker, a malformed envelope, a 12-byte IV or 16-byte tag of any other length,
+  and a JSON file that carries a `sealed` field without the first line are all "failed its integrity
+  check", never a plaintext session; the decipher is created with `authTagLength: 16`, so a truncated
+  tag cannot pass. The AAD is the file's role and name (`session:<site>`, `capture:<id>`), so a
+  sealed file renamed to another site's is refused. `kid` is an HMAC of the key, so a file sealed
+  under another key says which one (`key`) instead of failing as tampered.
+- **The key**, looked up once per process and cached:
+  - `API_ANYTHING_KEY`, when set, overrides the OS store: scrypt (N=2^15, r=8, p=1) of the passphrase
+    under a random salt kept in `key-salt.json` with the key's `kid`, so a wrong passphrase is a
+    clear error before anything is read or written. Containers and CI use this. A damaged
+    `key-salt.json`, or a missing one while passphrase-sealed files exist, is an error whose `next`
+    says to restore the original from a backup, or to start over (`logout` each site, delete the
+    captures, log in again): a new salt would make another key and orphan those files.
+  - macOS: the login Keychain through `/usr/bin/security`, service `api-anything`, account
+    `data-key`, created on first need. The secret goes in on stdin (`security -i`), never on the
+    command line, and without `-U`, so a key another process added first is kept and read back. An
+    item `security` creates lists `security` as a trusted application in its access control, so the
+    later `find-generic-password -w` by the same binary reads it with no dialog. One lookup costs one
+    subprocess, about 20 ms in a fresh process; the passphrase's scrypt costs about 60 ms.
+  - Linux: `secret-tool` (libsecret), when it is on PATH and a session bus answers.
+  - Windows: DPAPI (CurrentUser) through PowerShell's `ProtectedData`; the protected blob is
+    `data-key.dpapi` in the home, readable only by the same Windows account.
+  - The key store is one small interface (`KeyStore`: `get`, `put`, `lock`); tests inject an
+    in-memory one, and a process under `node:test` (`NODE_TEST_CONTEXT`) never reaches an OS store.
+  - **Creating the key** is first-writer-wins, since `secret-tool store` and DPAPI's file replace a
+    key that is there. A process that finds no key takes the key lock, looks the key up again, and
+    only then puts a new one; it then uses what the store reads back. The lock is not `withLock`
+    (which expires at 10 s and then goes ahead unlocked, while one store subprocess may take 15 s): its
+    file holds the holder's pid, it is taken over only when that process is gone or after 120 s (three
+    store calls of up to 15 s, plus margin), and a waiter that times out fails instead of going ahead.
+    The Keychain and the Secret Service are shared by every home of the user, so their lock is per
+    user (`$XDG_RUNTIME_DIR` or the per-user temporary directory, `api-anything-<uid>/data-key.lock`),
+    not per home; DPAPI's blob lives in the home, so its lock does too. This was chosen over naming the
+    stored item after a hash of the home: one key per user keeps a moved or copied home readable.
+- **Fail closed.** Plaintext is written in one case only: this home has never sealed a file, and
+  the key store is not here at all (`KeyUnavailable`: no `security`, `secret-tool` or PowerShell
+  binary, no session bus, no Secret Service on the bus, an unsupported OS). Every other key error is a
+  `SealError` with a `next`, and nothing is written: a store that exists and fails (a locked
+  keychain, a timeout), any error with `API_ANYTHING_KEY` set, and a missing store in a home that has
+  sealed. A home has sealed once `sealed.json` exists (written before the first sealed file) or any
+  session or capture file is sealed; there, not even `API_ANYTHING_PLAINTEXT=1` writes plaintext.
+  Failures are never cached, so the next operation asks the store again; a key, and a store found
+  missing, are cached for the process.
+- **No key** (a headless container, Linux with no session bus, never sealed): saving is not refused,
+  since that would break the container and CI use INTEGRATIONS.md supports. Files stay 0600 plaintext
+  and that is said once: the CLI prints one warning on stderr per process when it writes one, `status`
+  lists a `plaintext` problem for each unsealed session file, and `status` and `site_status` carry
+  `storage: {sealed, key | why, chosen}`. `API_ANYTHING_PLAINTEXT=1` records the choice and silences
+  both (it does not turn sealing off where a key exists).
+- **Migration**: a plaintext file still reads, and is written sealed the next time it is saved. The
+  first time a process has a key for a home whose `sealed.json` does not say `migrated`, the existing
+  session, capture and snapshot files are sealed in place (captures keep their modification time, which
+  pruning reads). Each session (and snapshot) is re-read and sealed under the same lock its writers
+  take (`tryLock(sessionFile(site))`), so an update made meanwhile is not lost; `withLock` is re-entrant
+  within a process, so a caller already holding that lock (migration starts inside the first save)
+  seals it at once. A session whose lock stays busy for 1 s, or a corrupt or unwritable file, is left
+  for the next process or the next `status` (which retries even in a long-lived MCP server), and
+  `migrated: true` is recorded only when none is left. Until then `status`
+  lists each unsealed session, and the unsealed captures, as `plaintext` problems.
+- **Not covered**: api-anything's own Chrome profile (`profile/`). Playwright starts Chrome with
+  `--use-mock-keychain` (macOS) and `--password-store=basic` (Linux), so the cookies `login` adds there
+  are encrypted under a fixed key. Using the real Keychain there would show Chrome's own Keychain
+  dialog on every launch; `logout` clears a site from it.
 
 `node:sqlite` is chosen over the `sqlite3` CLI: it is built in (no dependency, present on every
 Node ≥ 22.13, which the `engines` floor now requires; its one ExperimentalWarning is silenced) and
@@ -1660,7 +1898,7 @@ independent alternative.
     and `alternatives` URLs are shown the same way, and so are the request URLs and bodies `inspect`
     shows (keeping its `--example` values). None is `data`, which stays the site's answer
   - `add <site> <op> --trigger <url-template> --example k=v [--example2 k=v] [--match ...] [--pick ...] [--paging ...] [--write]`
-  - `call <site> <op> [k=v ...] [--allow-writes] [--again] [--idempotency-key <k>] [--force]` (`--force`: send while the site cools down; a success ends the cool-down)
+  - `call <site> <op> [k=v ...] [--max-age <duration>] [--changes] [--changes-only] [--watch <name>] [--allow-writes] [--again] [--idempotency-key <k>] [--force]` (`--force`: send while the site cools down; a success ends the cool-down; `--max-age` and `--changes`: see Watching, under Response extraction)
     accepts `--json -` for an args object on stdin (at most 4 MiB); positional `k=v` overrides its keys.
   - `batch [--input <file> | -] [--concurrency 1..4] [--limit 1..200] [--max-tier 1|2|3]`
     reads JSONL `{id?, site, op, args?}` from the file or stdin (the default). `batch.ts`'s
@@ -1672,7 +1910,8 @@ independent alternative.
     different sites, and one site's items (case variants included) never overlap or change order.
     This keeps `store.ts`'s send slots and lets a call record its cool-down before that site's next
     item checks it. Valid reads during a cool-down answer from it without sending. Other failures
-    do not stop later items. No caching, automatic pagination or retry of an entire batch.
+    do not stop later items. `--max-age`, `--changes`, `--changes-only` and `--watch` apply to every item, as for
+    `call`. No automatic pagination or retry of an entire batch.
     Sites must be installed first; a batch does not pull them implicitly. The whole input is bounded
     before any call: at most 200 lines (a lower `--limit` only), 4 MiB. An oversized input fails as a
     whole; a malformed or blank line gets its own `input` result, without quoting its contents. A
@@ -1696,7 +1935,9 @@ independent alternative.
     learning a request that a `--write` capture aborted, under any op name: the guard stopped it as a
     write, and that verdict counts, not the method (a POST the capture let through is a read). Captures hold
     full responses and the run's cookie values (one page can be tens of MB), so each new one prunes
-    the directory to the newest 20, none older than 24 h.
+    the directory to the newest 20, none older than 24 h, and `loadCapture` refuses (and deletes) one
+    whose `at` is past 24 h, with a `next` to capture again. They are sealed like session files (see
+    "Sealed files" under Logging in).
   - `capture --outline` / `inspect --outline` (the explorer's scout, `outline.ts`): for the top
     candidates, a compact summary instead of the body — where the example values sit, a suggested
     extract and pick fields with samples, JSON the page embeds (JSON-LD, `__NEXT_DATA__`,
@@ -1729,6 +1970,30 @@ independent alternative.
     and no response samples are gathered for discovery. A shape stripped on export leaves the
     corresponding hints unknown. A learned `null` also stays unknown: the shape uses it for a
     field absent from some items, not only a JSON null.
+  - `setup [--agents <list>|all] [--yes|--no-share] [--verify|--no-verify] [--local-only|--no-local-only] [--pin] [--share-only] [--dry-run]`
+    (`setup.ts`) connects agents only by a choice: `--agents` (`all` is every agent found but
+    Hermes), or on a terminal one question listing the agents found, `Connect API Anything to: 1)
+    Claude Code 2) Codex ... [Enter = all, numbers like 1,3, n = none]`; the person typed `setup`, so
+    Enter connects the listed ones. Hermes is never listed: it is an always-on gateway, where a
+    browser-capable tool is a deliberate choice, so it is connected only when named and the summary
+    says "found, not connected (always-on gateway): add with --agents hermes". With no terminal and
+    no `--agents` it connects nothing and answers `notConnected`, each agent found with the command
+    that connects it. `--dry-run` asks nothing and reports each case (`selection`: `named`, `asked`,
+    `would ask` with what each offered agent would get, `none`). An agent following INSTALL.md
+    names itself and asks the user before adding another. Then the sharing questions (see Sharing
+    specs) and `localOnly`; the summary says plainly which of sharing, verification and local-only
+    is on. Entries run `npx -y api-anything mcp`, unpinned: an exact pin leaves most installs on old
+    versions (docs/INTEGRATIONS.md, "An old global install wins"), and releases carry npm provenance
+    from trusted publishing. `--pin` writes `api-anything@<this version>` into every entry it writes
+    (the shell entry, the GUI-app entry, Hermes's, Codex's TOML, and the agents' own `mcp add`), and
+    moves the pin of an entry that is setup's own npx form (`npxEntry`: npx, then `-y`,
+    `api-anything[@version]`, `mcp`, nothing else); any other entry stays the user's. A move changes
+    only the package argument (`repin`): the command, `env` (a user's `API_ANYTHING_HOME` or
+    `API_ANYTHING_LOCAL_ONLY`), `cwd` and every other field stay, and the GUI entry's `PATH` is added
+    only to an entry with none. Without `--pin`
+    a pinned entry is kept as it is. `mcp --print-config --pin` prints the pinned form, and `status`
+    (no site) adds `configs`: each agent config with an api-anything entry and its pin (`false` for
+    unpinned, `custom` for an entry setup did not write).
   - All output is JSON-first, compact, and ends with a `next` hint on failure.
   - A call's result says what happened in fields as well as prose: `retry` (`safe`, `after_wait`,
     `after_fix`, `no`), `retryAfterMs`, `nextCall` (`{action, site, op}`, with `mode` for a window
@@ -1780,8 +2045,8 @@ independent alternative.
   `next`, `call_operation`'s description and the skill tell the agent to check it is the site the user
   means before calling, since a name or description can imitate another site. When a share
   needs the user's yes, the prompt (MCP elicitation or the CLI's) and the `next` that tells the agent to
-  ask list the upload's `personal` items. With `share` on, an
-  idle server verifies a few candidates a day and flushes call reports (see Sharing specs). The agent may be steered by page content, so MCP `login` import
+  ask list the upload's `personal` items. With `share` on, a server flushes call reports, and with
+  `verify` on too an idle one verifies a few candidates a day (see Sharing specs). The agent may be steered by page content, so MCP `login` import
   only refreshes a site that has a spec and a browser source a human chose with the CLI, from that
   same profile; anything else answers `next`: ask the user to run `api-anything login <site>`. Mode
   window is allowed (a human signs in). So an `auth` result points at the login tool (`next`, and
@@ -1821,7 +2086,8 @@ independent alternative.
     directly with its `inputSchema` and a read's or a write's hints; writes only with
     `--allow-writes`. The model calls it without `list_operations` first, at about 200 tokens of
     tool list per op, sent with every request (the five meta-tools are about 950; goodreads' five
-    ops add about 1,000, all 25 bundled ops about 5,700), which is why it is opt-in. A name is at most 40 characters (Gemini
+    ops add about 1,000, all 25 bundled ops about 5,700; those counts predate output schemas, which
+    add more for a client that shows them to its model: see Output schemas), which is why it is opt-in. A name is at most 40 characters (Gemini
     CLI cuts `mcp_<server>_<tool>` past 63, and Cursor is reported to drop a tool whose server and
     tool names pass 60); a longer one is cut and ends in 8 hex characters of a hash of the whole,
     so two stay distinct. The description is the op's, the keys its items carry, and where its
@@ -1866,15 +2132,55 @@ independent alternative.
     writes-enabled server. Each item's data uses `asTable`, and its `next`/`nextCall` use MCP
     terms; a retry names `call_operation` with that item's args, never a repeat of the batch.
     As with `call_operation`, a batch still running at the deadline answers with a job, and
-    identical running batches join it. Finished results are kept only by the normal jobs mechanism,
-    not as a cache of read calls. `list_operations` installs a missing site before batching it.
+    identical running batches join it. Its `maxAgeMs`, `changes`, `changesOnly` and `watch` apply to every item,
+    as `call_operation`'s do (Watching, under Response extraction); the job's own result is kept
+    only by the jobs mechanism. `list_operations` installs a missing site before batching it, and
+    shows a site's `pace` and an op's `key`.
   - Each answer is JSON text and, when it is an object, the same object as `structuredContent`. A
     client gives its model one of the two, never both: Codex and VS Code send the structured one
     and drop the text, Gemini CLI sends the text, so neither costs tokens twice, and a program
     reads the fields without parsing. `list_sites` (a list) is text only: before the 2026-07-28
-    revision structuredContent is an object. No tool declares an `outputSchema`: the SDK would
-    then reject an answer that does not match it, and a failure's shape differs from a success's.
-    `isError` is true exactly when `ok` is false, except for `pending`.
+    revision structuredContent is an object. `isError` is true exactly when `ok` is false, except
+    for `pending`.
+  - **Output schemas** (`schema.ts`). Every tool but `list_sites` declares an `outputSchema`, so a
+    framework can validate answers and a model sees the field names. A schema that does not match
+    an answer breaks the call: the SDK's server checks only a non-error answer, but its client (as
+    other strict clients) checks the `structuredContent` of every answer, `isError` ones included,
+    and refuses a non-error answer with none. So `list_sites`, whose answer is a list, declares
+    none, and each schema covers every answer its tool gives: success, each failure class, a
+    pending job, the tool's own `{ok: false, error, next}`, and a cut answer. They are
+    permissive: every object allows fields it does not name, and a field is required only when
+    every answer carries it (`ok`, on the call tools, `call_batch`, `get_job`, `get_result`,
+    `site_status` and `learn_site`; nothing on `list_operations`, `find_sites` and `login`, whose
+    own errors have no `ok`). A type is given only where the code fixes it; the enums (`class`,
+    `write`, `retry`, `tier`, `nextCall.action`) are checked by tsc against the code's own unions,
+    so a new value cannot reach an answer before it reaches the schema. `get_job`'s is a call's
+    result widened to any job's answer. No validated schema constrains `data`, a per-op tool's
+    included: a tool's schema is fixed when the server starts, but each call runs the spec as it
+    is then, so a heal from the registry or a re-add during the session could change a pick's type
+    and fail a good answer (and a write's 204 has no data, whatever its recipe). Only the envelope,
+    which the code's own types fix, is typed. The SDK takes zod, so each JSON Schema is the meta of a
+    loose zod object: the server's own check is only that the answer is an object, and the
+    advertised JSON Schema is the contract. They are plain draft-07 with no type lists or
+    `const`, so an OpenAPI 3.0 document can embed them. They name fields and types only, with no
+    descriptions (the tools' descriptions say what the fields mean) and no
+    `additionalProperties` (the default allows them). The call tools and per-op tools share one
+    envelope object, and `call_batch`, `get_result` and `learn_site` name only the fields their
+    answers carry: `tools/list` is sent with every request, and the schemas take the default tool
+    list from 16.6 KB to 29.6 KB of JSON and add about 1.8 KB to each per-op tool, paid by a client
+    that hands them to its model. `CALL_RESULT_SCHEMA` is what other interfaces validate against.
+  - `opDataSchema(op)` describes a read's `data`, for documentation only (an OpenAPI document,
+    `hostSite()`'s `resultSchema` through `callResultSchema(dataSchema)`); nothing validates an
+    answer against it. It reads the response recipe only, never the learned shape (one capture's,
+    and a learned `null` marks a field some items lack): a list when the recipe always makes one
+    (an HTML recipe's items, an extract path through a `[*]` step, as the extractor parses it, so
+    a quoted key `["a[*]"]` is not one), the fields its pick or HTML recipe names, none required,
+    and a type only where the recipe fixes it (a pick regex's string, an HTML field's text or
+    `all:` list, a path through `[*]`'s list). A field two picks write is untyped. An item of a
+    pick's list is not typed an object, since a pick keeps a non-object item as it is. A write's
+    `data` is `{}`. It describes the stored recipe's whole answer, not a `view.fields` projection.
+    `test/schema.test.ts` drives the server with the SDK's own client and checks every tool's real
+    answers against what it advertises, including after the spec changes on disk mid-session.
   - `call_operation` sends `data` that is a list of two or more records as `{columns, rows}` (a
     missing field is null) when that makes the JSON smaller. A sparse table can be larger than the
     original records, so those stay a list to preserve the output cap. The keys, repeated in every
@@ -1896,6 +2202,79 @@ independent alternative.
     the domain, follow `next` once, writes only on request), for a client that loads no skill
     (Claude Desktop takes skills only as an upload); every session pays for them, so they stay a few
     sentences.
+- **HTTP server** (`api-anything serve`, `serve.ts`, `openapi.ts`; how to use it: [SERVE.md](SERVE.md)).
+  stdio reaches only a client that starts a local process; n8n, Make, Zapier, Dify, Postman, a
+  custom GPT's actions and plain HTTP clients cannot. One `node:http` port serves three surfaces:
+  MCP over the SDK's Streamable HTTP transport at `/mcp`, JSON endpoints under `/v1`, and an
+  OpenAPI 3.1 document at `/openapi.json`. It takes `mcp`'s flags (`--allow-writes`, `--sites`,
+  `--no-learn`) plus `--host`, `--port`, `--cors`, `--public-url` and `--max-concurrent`.
+  - **Answers are the tools' answers by construction.** `createToolset` (mcp.ts) builds the
+    server and keeps each registered tool's handler and its input schema. A REST endpoint checks
+    its body with that schema (a refusal is HTTP 400) and runs the same handler, so `GET /v1/sites`
+    is `list_sites` and `POST /v1/call/{site}/{op}` is `call_operation`, including the
+    `next`/`nextCall` rewrites into MCP terms, refusals and pulls. No tool definition is
+    duplicated. Two things differ. `data` is call()'s, as the library returns it: a list stays a
+    list of records. `asTable`'s `{columns, rows}` saves an agent tokens, but a program would have
+    to undo it, so the handler keeps the records beside each reply it tables (`recordsAnswer`, a
+    WeakMap: what MCP sends is unchanged, and a job either surface started answers both in their
+    own form). And each answer gets `nextRequest` `{method, path, body?}`, the REST request for
+    the step `nextCall`, a pending `job` or a cut answer's `more` names, when an endpoint takes
+    it. A read's `maxAgeMs`, `changes`, `changesOnly` and `watch` go to the tool as its own
+    arguments, checked by its schema. REST also takes `maxTier` on a call, passed through
+    `callOperation`'s and `callWrite`'s `extra`. An MCP call has no extra, so its job keys are as
+    before. HTTP status is 200 whenever
+    the call ran, whatever its `class`. A status that changed with the outcome would make every
+    HTTP client treat an `auth` or `drift` answer as a transport error and drop the `next` that
+    says what to do.
+  - **A bounded number of calls at once.** One `Permits` (jobs.ts) shared by REST and every MCP
+    session, 8 unless `--max-concurrent` says otherwise. A new job takes its permits before it
+    starts and holds them until its work settles, not until the HTTP answer says `pending`, since
+    the call is still running then. Joining a running job takes none. A batch takes one per call
+    it runs at once (its concurrency, at most the limit). With none free the call is refused at
+    once, before anything runs: REST answers HTTP 429 with a call result `{ok: false, class:
+    "rate", reason: "server busy", retryAfterMs}`, MCP the same as the tool's answer. A queue
+    instead would hold a request past its client's timeout, and the client would send it again.
+  - **No request ends the process.** Everything a request does, parsing its target included, runs
+    inside one boundary: a request it cannot read is a 400, a bug a 500. The CLI also logs an
+    unhandled rejection instead of exiting (`guardProcess`). A socket idle for 120 s is closed
+    (`server.timeout`), except an MCP `GET /mcp` event stream, which is quiet until the server has
+    something to say.
+  - **One job table.** Each MCP session gets its own server (a server has one transport; the
+    session is stateful, so `learn_site`'s elicitation can be answered). Every session and the REST
+    surface share one `Jobs`, so `GET /v1/jobs/{id}` finds a job any of them started, and an
+    identical call from anywhere joins the running one. That way a write is never sent twice
+    across clients. At most 64 sessions are kept; past that, the least recently used is closed.
+  - **Guarded like a key**, since it acts with the user's sessions. A bearer token on everything
+    but `GET /v1/health`: `API_ANYTHING_TOKEN`, else `~/.api-anything/serve-token`, created with
+    `wx` and mode 0600 so two first starts keep one token. Tokens are compared as SHA-256 digests
+    with `timingSafeEqual`, so the time depends on neither token's length. Any `Origin` not listed
+    with `--cors` is refused (403) before auth: a page the user visits can send requests to
+    loopback, and a page has no business with this server. `*` is refused. Bound to loopback, any
+    `Host` other than the loopback names with the port, or `--public-url`'s host, is refused,
+    which blocks DNS rebinding (a page whose domain resolves to 127.0.0.1 still sends its domain
+    as Host). A listed origin's CORS preflight (`OPTIONS`) is answered 204 without the token, as
+    browsers send preflights without credentials; it runs nothing, and the request it clears still
+    needs the token. The token file is written whole under a temporary name, mode 0600, then
+    linked into place (`linkSync` fails when the file exists, and the start that lost reads the
+    winner's), so two first starts keep one token and neither reads a half-written file. The token
+    is never printed to stdout; stdout carries exactly one JSON line once the server listens, and
+    everything after goes to stderr. Bodies are capped at 1 MB (413).
+  - **The OpenAPI document** is generated per request, from the tools' own zod schemas
+    (`z.toJSONSchema`; a tuple's `prefixItems` is flattened to `items`, the only form many loaders
+    read) and the installed specs. It has one concrete `POST /v1/call/<site>/<op>` path per read,
+    with `operationId` `<site>__<op>` (`[^A-Za-z0-9_]` as `_`, numbered on a collision), `args`
+    typed with `inputSchema(op)` and the answers described by schema.ts, the MCP output schemas'
+    source: `data` is `opDataSchema(op)`, from the recipe alone, which leaves open what the recipe
+    does not fix (an item of any type unless an HTML recipe makes objects, a single result of any
+    shape), so a validating importer takes a list of strings such as `youtube.suggest`'s. Paths
+    are capped at 300, and descriptions at 300 characters, a custom GPT's limit. A shared site's
+    description starts with `SHARED_NOTE`, as a per-op tool's does. `--sites` narrows the paths
+    and the per-op MCP tools, not what `/v1/call` reaches: the endpoints are the tools, and the
+    tools reach every installed site.
+  - Shutdown on SIGINT/SIGTERM stops accepting, waits up to 30 s for answers in flight (an open
+    `GET /mcp` event stream is not one), closes the MCP sessions, then settles reports and closes
+    the browser. An idle server verifies candidates as the stdio one does; every request counts
+    as activity.
 - **Skill** `skills/api-anything/`: `SKILL.md` is the core an agent loads whenever a request is about
   a website: the find, call, learn loop, the few result fields the agent must tell the user about,
   the strict failure loop (follow `next` at most once, then stop and report), and the safety rules.
@@ -1906,7 +2285,7 @@ independent alternative.
   copies the folder to
   `~/.claude/skills` (Claude Code) and `~/.agents/skills` (Codex, Cursor, Gemini CLI, VS Code) and
   records where (`skill.ts`). Each copy carries a stamp, `.api-anything.json`: the version and a hash
-  of the files. Since the server runs through `npx -y api-anything`, it is always the latest release
+  of the files. Since the server runs through `npx -y api-anything` (unless `--pin`), it is always the latest release
   while a copy is not, so any CLI start (the server's included) replaces a recorded copy that an
   older version wrote and nobody edited. An edited copy, a link, a newer version's copy, and a
   same-version copy with other files (a checkout beside a release) are left alone. A copy from before
@@ -1915,10 +2294,13 @@ independent alternative.
   `API_ANYTHING_HOME` refreshes only the copies its own setup recorded.
 - **Claude Code plugin** manifest (skill + MCP), its version held equal to the package's by a test,
   plus copy-paste install lines for Codex and other agents.
-- Library: `import { call, callReads, closeBrowser } from "api-anything"`. `callReads(items, opts)`
+- Library: `import { call, callReads, shutdown } from "api-anything"`. A script awaits `shutdown()`
+  after its last call (in a `finally`): a call can start background registry work (a bundled site's
+  upgrade, its reports), which `shutdown` gives up to 2 s to finish and flush, then aborts, and it
+  closes the browser, so the process exits. `closeBrowser` closes only the browser. `callReads(items, opts)`
   is an async iterable of `BatchResult`; `BatchItem` and `BatchOptions` are exported too. It takes
   an array of at most 200 items, `maxItems` to lower that cap, `concurrency` (default 1, at most 4),
-  and the call options `maxTier`, `timeoutMs`, `fetchImpl`. Invalid bounds or too many items throw
+  and the call options `maxTier`, `timeoutMs`, `fetchImpl`, `maxAgeMs`, `changes`, `changesOnly`, `watch`. Invalid bounds or too many items throw
   before any call; invalid items fail individually. Breaking iteration starts no further calls
   and waits for those already running to finish.
 - Library: `call`, `describeOperation(siteSpec, op)`, `prepareLink(siteSpec, sourceOp, item, link,
@@ -1933,11 +2315,20 @@ independent alternative.
   Installed specs remain unchanged. The transport ladder, own-profile sessions, write ledger and
   readback, pacing, cool-downs, local logs and result caps stay in use. See [HOST.md](HOST.md) for
   approval binding, dynamic-value placeholders and the Bun export condition.
+- **Python** (`python/`, the PyPI package `api-anything`; [PYTHON.md](PYTHON.md)): a standard-library
+  client of `serve`'s HTTP routes, which can start the server itself (`api-anything` on PATH, else
+  npx), per-op tool definitions named as MCP's per-op tools, and `python -m api_anything gen <site>`,
+  a typed module for a site's reads. Neither the client nor a generated module sends a request to a
+  site, holds a credential or reads the session: every call goes through the server, so the ladder,
+  healing, cookie re-import and the classifier apply unchanged, and a second copy of `codec.ts` and
+  `http.ts` in Python is never needed (issue #29). A generated module depends only on the ops' names,
+  arg schemas and output hints, never on examples or notes, so the same description gives the same
+  bytes and a healed site the same file.
 
 ## Non-goals (v1)
 
 TLS impersonation transports, CAPTCHA solving, signature reimplementation, seroval parsing,
-a marketplace (the registry stores and counts; see Sharing specs), typed-client codegen, Windows app-bound cookie decryption
+a marketplace (the registry stores and counts; see Sharing specs), Windows app-bound cookie decryption
 (login falls back to `--window` there), and local operations (below).
 
 **Local operations.** An op is a request to a site, sent by the ladder. An op that runs a program on

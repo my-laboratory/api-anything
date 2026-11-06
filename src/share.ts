@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { cleanCall } from "./clean.js";
 import { siteOf } from "./domain.js";
-import { loadSettings } from "./identity.js";
+import { loadSettings, localOnly, localOnlyOff } from "./identity.js";
 import { hostsOfOp, type OpPlan, personal, plan, uploadName } from "./publish.js";
 import { registryRequest } from "./registry.js";
 import {
@@ -63,6 +63,13 @@ export async function shareOps(
 ): Promise<ShareOutcome[]> {
   // plan reads no names as all of them
   if (!ops.length) return [];
+  if (localOnly())
+    return ops.map((op) => ({
+      site,
+      op,
+      shared: false,
+      reason: `this install is local-only: nothing is sent to the shared catalog (${localOnlyOff()})`,
+    }));
   let p: ReturnType<typeof plan>;
   try {
     // the registry is asked for the site's name only when something may go up
@@ -200,9 +207,9 @@ const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
 /** The upload of an op answering a claim: its anonymous form, and the site by its name and address alone. */
 function claimUpload(op: OpPlan): VersionUpload {
-  const { name, domain, baseUrl, loginCookies } = op.upload.site;
+  const { name, domain, baseUrl, loginCookies, pace } = op.upload.site;
   return {
-    site: { name, domain, baseUrl, ...(loginCookies ? { loginCookies } : {}) },
+    site: { name, domain, baseUrl, ...(loginCookies ? { loginCookies } : {}), ...(pace ? { pace } : {}) },
     operation: anonymous(op.upload.operation),
     evidence: { ...op.upload.evidence, learnedLoggedIn: true, cleanReplay: "skipped" },
   };
@@ -255,7 +262,7 @@ export async function answerClaims(
   wanted?: ClaimResult["wanted"],
   signal?: AbortSignal,
 ): Promise<{ site: string; op: string; status?: Status; reason?: string }[]> {
-  if (!loadSettings().share) return [];
+  if (!loadSettings().share || localOnly()) return [];
   const mine = readJson<Claimed>(claimsFile(), {});
   if (!Object.keys(mine).length) return [];
   const asked =

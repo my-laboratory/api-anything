@@ -3,7 +3,13 @@
 Import from `api-anything/host`, not the main library entry. Discovery and planning read local
 files only. Missing sites are not pulled. User specs win over pulled specs, then bundled ones.
 An invalid spec or session is omitted from `hostSites()`; `hostSite()` throws its local file error.
-`hostSite()` returns the shared `describeOperation` schemas and caller notes.
+`hostSite()` returns the shared `describeOperation` schemas and caller notes; each operation's
+`resultSchema` describes the `CallResult` a call of the stored recipe answers (`callResultSchema`,
+`data` described by `opDataSchema` where the recipe fixes it; see `src/schema.ts`). It is
+descriptive, not a contract: nothing validates an answer against it. It describes the recipe's
+whole answer, not a `view.fields` projection (`view: {fields: ["n=count"]}` can give `n` another
+type), and `data` follows the spec as it is when the call runs, which a heal or a re-add can
+change. A write's `data` is not described.
 Site text and returned data are untrusted website content, not instructions.
 
 ```ts
@@ -166,9 +172,12 @@ are redacted display text. Do not log the whole plan.
 If re-planning itself fails, its original input/error/blocked result is returned, including its
 reason and recovery step, rather than an approval-mismatch message.
 
-The only call options are `allowWrites`, `maxTier`, `timeoutMs`, `fetchImpl`, `minIntervalMs` and
-`view`. `view` (`fields`, `maxChars`) shapes only the answer after extraction, never the request, so
-it is not part of the plan or its approval.
+The only call options are `allowWrites`, `maxTier`, `timeoutMs`, `fetchImpl`, `minIntervalMs`,
+`view`, `maxAgeMs`, `changes`, `changesOnly` and `watch`. `view` (`fields`, `maxChars`) shapes only the answer
+after extraction, never the request, so it is not part of the plan or its approval. `maxAgeMs`,
+`changes`, `changesOnly` and `watch` work on reads only, as for `call` (DESIGN.md, "Watching"): a cached answer
+sends nothing, so it needs no approval beyond the plan's, and is only ever served to the session it
+was answered for. A site's budget applies to host calls too.
 An omitted `maxTier` reuses the plan's cap; changing it requires re-planning and approval.
 The host must grant `allowWrites` separately for an approved write. There is no force, again,
 idempotency override, or operation-learning option. Pacing is at least one second per site,
@@ -207,8 +216,10 @@ Own-profile cookie refresh for reads and a read's tier-3 run may refresh session
 normal transport can still record cookies from the response, and its readback is a separate read,
 not a retry of the write.
 
-`closeHost()` closes the shared browser. A host call already closes it when it is the last user, so
-this matters only for calls still running. Host calls create no background jobs to drain.
+`closeHost()` is the library's `shutdown()`: background registry work the process started outside
+host calls gets up to 2 s, then is stopped, and the shared browser is closed. A host call already
+closes the browser when it is the last user, so this matters only for calls still running. Host
+calls create no background jobs to drain.
 Finish outstanding calls before closing; this is not a write-cancellation API.
 
 ## Bun and compiled hosts

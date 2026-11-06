@@ -6,15 +6,17 @@ import { parseArgs } from "node:util";
 import { z } from "zod";
 import { BATCH_CONCURRENCY, BATCH_MAX, type BatchItem, callReads } from "./batch.js";
 import { browserAvailable, closeBrowser, ProfileInUse } from "./browser.js";
+import { parseDuration, sitePace } from "./budget.js";
 import { verifySite } from "./checks.js";
 import { botWall, emptyResults, htmlFinds, loginPath, signInForm } from "./classify.js";
 import { launchOf, printConfig } from "./clients.js";
 import { describeOperation } from "./describe.js";
-import { type CallResult, call, heal, type Tier } from "./execute.js";
+import { type CallOptions, type CallResult, call, heal, type Tier } from "./execute.js";
 import { capOutput, extract, getPath, innerJson, pick, returnedFields, splitPick } from "./extract.js";
 import {
   addOperation,
   type CaptureFile,
+  CaptureUnavailable,
   capturePage,
   captureTrigger,
   fillTrigger,
@@ -26,12 +28,13 @@ import {
   unplaced,
 } from "./heal.js";
 import { buildRequest, unknownArgs } from "./http.js";
-import { answerShare } from "./identity.js";
+import { loadSettings, localOnly, localOnlyOff, setLocalOnly } from "./identity.js";
 import { AmbiguousProfile } from "./import.js";
 import { type Candidate, capturePages, matches, pageUrls, rankCandidates } from "./learn.js";
 import { learnSite } from "./learnsite.js";
 import {
   cookieNames,
+  ImportRefused,
   importSession,
   importWarning,
   knownGuests,
@@ -43,12 +46,24 @@ import {
 import { type Outline, outline } from "./outline.js";
 import { pagingFlag, pagingHints } from "./paging.js";
 import { plan, uploadName } from "./publish.js";
-import { pull, RegistryError, reportInterface, search } from "./registry.js";
+import { LocalOnlyError, pull, RegistryError, reportInterface, search } from "./registry.js";
 import { settle } from "./report.js";
 import { getResult, type ResultView, viewProblem } from "./results.js";
+import { onPlaintext, plaintextWarning, SealError } from "./seal.js";
 import { captureLive, redact } from "./secrets.js";
 import { loadSession, placeholders } from "./session.js";
-import { AGENTS, type Agent, askYesNo, setup, summary } from "./setup.js";
+import {
+  AGENTS,
+  type Agent,
+  answersSummary,
+  askAgents,
+  askYesNo,
+  configPins,
+  guiServer,
+  record,
+  setup,
+  summary,
+} from "./setup.js";
 import { shareOps } from "./share.js";
 import { refreshSkills } from "./skill.js";
 import {
@@ -99,7 +114,12 @@ const HELP: Record<string, string> = {
   By default imports the site's cookies from your everyday browser (you are almost always already
   signed in there, so no password and no re-doing 2FA). Prints which profile was used and the cookie
   NAMES only (plus the profile's display name and Google account). The imported session is the SAME
-  one as your browser: if the site logs it out, both go.
+  one as your browser: if the site logs it out, both go. The first import of a domain from a browser
+  profile asks first, on the terminal: Import <domain> cookies from <profile>? [y/N]. Without a
+  terminal it reads nothing and refuses; --window and --cookies need no terminal, and a later import
+  of that domain from that profile asks nothing. API_ANYTHING_ALLOW_IMPORT=github.com,linkedin.com
+  pre-approves those domains for automation you set up. On macOS, choose Allow on the Keychain
+  dialog, not Always Allow.
   <site|url>  a site name (linkedin), a domain (linkedin.com, www.linkedin.com) or a URL
   --profile   the browser profile to import from, e.g. "Chrome/Profile 1". Needed when several
               profiles are signed in to the site (possibly different people's accounts): login
@@ -190,7 +210,7 @@ const HELP: Record<string, string> = {
   so nothing shows the server reads those params (publish refuses the op until it does).
   An op whose captured response is a bot challenge, a sign-in page, a rate limit or a server failure
   is not saved.`,
-  call: `api-anything call <site> <op> [k=v ...] [--json <args-object>] [--fields a,b] [--max-chars n] [--allow-writes] [--again] [--idempotency-key <k>] [--max-tier 1|2|3] [--force] [--dry]
+  call: `api-anything call <site> <op> [k=v ...] [--json <args-object>] [--fields a,b] [--max-chars n] [--max-age <duration>] [--changes] [--changes-only] [--watch <name>] [--allow-writes] [--again] [--idempotency-key <k>] [--max-tier 1|2|3] [--force] [--dry]
   Calls an operation: {ok, class, data, tier, healed?, heal?, ms, next?}; a failure also says retry
   (safe, after_wait, after_fix, no), retryAfterMs and nextCall, and a write says write (not_sent,
   not_applied, accepted, may_have_applied, applied: its readback found it). A paged read says
@@ -201,6 +221,18 @@ const HELP: Record<string, string> = {
   --fields a,b     project each extracted item (pick paths, including name=path); not site args
   --max-chars n    data budget, 256 to 200000 JSON characters (default 20000)
   A cut answer has resultId and more: retrieve it locally with api-anything result, not nextPage.
+  --max-age <d>    a read: answer from the last ok answer kept for the same args when it is at most
+                    this old (30s, 10m, 2h, 1d), sending nothing: cached, ageMs. Kept only for calls
+                    with --max-age or --changes, in ~/.api-anything/snapshots (0600, 30 days unused)
+  --changes        a read: changes {since, added, removed, changed, unchanged} against the previous
+                    ok answer for the same args ({first: true} the first time); list items are told
+                    apart by the op's key, an id-like field (id, url, ...) or a hash
+  --changes-only   changes without data, for cheap polling
+  --watch <name>   whose baseline --changes compares with and moves on (default "default"): two
+                    watchers of one query each see every change. Implies --changes. A --max-age
+                    answer never moves a baseline
+  A site's budget (its spec's pace; API_ANYTHING_PACE="interval=2s,perHour=60,<site>:perHour=30"
+  overrides it) answers rate with retryAfterMs and budget, sending nothing, once it is spent.
   --again          send a write refused as a duplicate (the same args within 10 minutes, and the
                     first may have gone through): only when the user checked the site
   --idempotency-key <k>  on the first call: a repeat of the write with the same key returns that
@@ -209,13 +241,14 @@ const HELP: Record<string, string> = {
                     3 minutes) or a block at every tier (10 minutes) calls answer without sending.
                     A forced call that succeeds ends the wait; one limited or blocked again starts
                     it over. A login for the site also ends the wait`,
-  batch: `api-anything batch [--input <file> | -] [--concurrency 1..4] [--limit 1..200] [--max-tier 1|2|3]
+  batch: `api-anything batch [--input <file> | -] [--concurrency 1..4] [--limit 1..200] [--max-tier 1|2|3] [--max-age <duration>] [--changes] [--changes-only] [--watch <name>]
   Read JSONL {id?, site, op, args?} from a file or stdin (the default), at most 4 MiB.
   Write one JSONL {id, site, op, ...callResult} per line in input order. Missing ids are 1-based
   line numbers. A malformed line answers input without echoing its contents. Empty input is empty.
   Sequential by default; concurrency is across sites only, with the usual pacing and cool-downs.
   --limit lowers the 200-line cap; oversized input is rejected before any calls. Sites must already
-  be installed (pull one first). Writes answer input: "writes are not batched". No caching.
+  be installed (pull one first). Writes answer input: "writes are not batched". --max-age, --changes,
+  --changes-only and --watch apply to every item, as for call.
   Exit 0 if every item is ok, otherwise 1. Failures do not stop later items.`,
   result: `api-anything result <resultId> [--offset n] [--fields a,b] [--max-chars n] [--format json]
   Reads a kept answer locally, with no site request or spec change. offset is an item index.
@@ -300,7 +333,8 @@ const HELP: Record<string, string> = {
   URL matches the sites whose operations use it (news.ycombinator.com). Each match says whether it is
   installed; pull one that is not. A match may list the site's own agent interfaces (an MCP server, an
   OpenAPI document); a domain search finds a site that has only those. API_ANYTHING_REGISTRY overrides
-  the registry's URL.`,
+  the registry's URL. Local-only (setup --local-only, API_ANYTHING_LOCAL_ONLY=1) searches this
+  machine alone, and the answer says so.`,
   interface: `api-anything interface mcp|openapi <url>
   Tells the registry a site offers its own agent interface: an MCP server or an OpenAPI document, https
   on the site's own domain. Once installs on enough distinct networks said so, search lists it beside
@@ -319,36 +353,73 @@ const HELP: Record<string, string> = {
   literal typed into the page). The param examples are sent: they must be values anyone may see. It
   refuses an op holding a live cookie or session value, or failing its checks. --yes sends them, signed
   with this install's key; an op that needed a login or writes is reviewed before others get it.`,
-  mcp: `api-anything mcp [--allow-writes] [--sites a,b] [--print-config] [--no-learn]
+  mcp: `api-anything mcp [--allow-writes] [--sites a,b] [--print-config [--pin]] [--no-learn]
   Serves list_sites, find_sites, list_operations, call_operation, call_batch, get_result, get_job, site_status, login and learn_site over
   stdio MCP, and call_write_operation with --allow-writes. list_operations and call_operation pull a
   shared site an agent asks for, with its reads only: its writes need a human's api-anything pull. Its
   login only refreshes a session a human imported here. A call still running after about 25 s answers
-  class pending with a job, which get_job waits for. With sharing on, an idle server checks a few new
-  shared operations a day, over plain HTTP with no cookies, and reports how calls went. learn_site
+  class pending with a job, which get_job waits for. With sharing on, it reports how calls went; with
+  verification on too (setup --verify), an idle server checks a few new shared operations a day, over
+  plain HTTP with no cookies. learn_site
   learns a read (as learn does); writes are learned here with add --write.
   --sites a,b     also serve each operation of these sites as a tool of its own (goodreads__searchBooks),
                   with its args' JSON Schema: no list_operations step first. Costs tokens per op
   --print-config  print the command or config entry that adds this server to Claude Code, Codex,
                   Gemini CLI, VS Code, Cursor and Claude Desktop, with absolute paths and the other
                   flags given, instead of serving
+  --pin           with --print-config: the npx form pinned to this version (api-anything@<version>)
   --no-learn      hide learn_site`,
-  setup: `api-anything setup [--yes | --no-share] [--share-only] [--agents claude-code,codex,cursor,claude-desktop,hermes,gemini,vscode] [--dry-run]
-  Connects the MCP server (npx -y api-anything mcp) to each agent found on this machine: Claude Code,
-  Codex, Cursor, Claude Desktop, Hermes, Gemini CLI, VS Code. Installs the skill for Claude Code
+  serve: `api-anything serve [--host 127.0.0.1] [--port 8787] [--allow-writes] [--sites a,b] [--no-learn] [--cors <origin>]... [--public-url <url>] [--max-concurrent 8] [--print-config]
+  Serves the MCP tools over HTTP, for clients that cannot start a process (n8n, Make, Zapier, Dify,
+  Postman, a custom GPT, any HTTP client): MCP over Streamable HTTP at /mcp, JSON endpoints under /v1
+  that answer as the library's call() does (data as records), and an OpenAPI 3.1 document at
+  /openapi.json with one path per installed read.
+  Prints one JSON line once listening ({ok, version, url, mcp, openapi, tokenFile}), then logs to
+  stderr. Every request but GET /v1/health needs Authorization: Bearer <token>: API_ANYTHING_TOKEN,
+  else the token in ~/.api-anything/serve-token, made on first start. A request from a browser page
+  (an Origin header) is refused unless its origin is listed with --cors. docs/SERVE.md has examples.
+  --host        the address to listen on; default 127.0.0.1. Anything but loopback lets other
+                machines try the token: it warns
+  --port        default 8787; 0 picks a free port
+  --allow-writes  serve POST /v1/write/{site}/{op} and call_write_operation
+  --sites a,b   MCP: each op of these sites as a tool of its own; OpenAPI: per-op paths for these
+                sites only (default every installed site, at most 300 paths)
+  --no-learn    hide POST /v1/learn and learn_site
+  --cors        a browser origin allowed to call (https://app.example.com); repeat for more
+  --public-url  the address a tunnel or proxy gives this server: its Host is accepted, and the
+                OpenAPI document names it as the server
+  --max-concurrent  calls running at once over REST and MCP together (default 8; a batch takes one
+                per call it runs at once); one more is answered at once with 429, class rate
+  --print-config  print curl, MCP-over-HTTP and n8n examples instead of serving`,
+  setup: `api-anything setup [--agents <list> | --agents all] [--yes | --no-share] [--verify | --no-verify] [--local-only | --no-local-only] [--pin] [--share-only] [--dry-run]
+  Connects the MCP server (npx -y api-anything mcp) to the agents you choose: Claude Code, Codex,
+  Cursor, Claude Desktop, Hermes, Gemini CLI, VS Code. On a terminal with no --agents it lists the
+  agents found and asks once which to connect (Enter = all of them). Hermes, an always-on gateway, is
+  never in that list: name it with --agents hermes. With no terminal and no --agents it connects
+  none, and prints the command that connects each agent found. Installs the skill for Claude Code
   (~/.claude/skills), for Hermes (~/.hermes/skills) and for Codex, Cursor, Gemini CLI and VS Code
   (~/.agents/skills); Claude Desktop takes skills only by upload. Checks for a Chromium browser, makes
-  this install's key, and asks whether to help build the shared catalog (default yes). Other entries
-  in an agent's config are never changed; a file is backed up to <file>.bak-api-anything before its
-  first edit. Running it again changes nothing. Afterwards, any command (the MCP server included)
-  updates a skill copy setup installed when a newer api-anything runs, unless the copy was edited.
-  --yes        share: answer the question yes without asking
-  --no-share   do not share; answer the question no
-  --share-only record --yes or --no-share and nothing else: no agent, skill or key is touched. learn_site
-               asks the question the first time something could be shared; this records the answer
-               given in chat, and changes it later
-  --agents     connect these agents only, found or not
-  --dry-run    print what would change, and change nothing`,
+  this install's key, and asks whether to help build the shared catalog (Enter = yes), then, after a
+  yes, whether an idle server may test new shared operations from your network (Enter = no). Other
+  entries in an agent's config are never changed; a file is backed up to <file>.bak-api-anything
+  before its first edit. Running it again changes nothing. Afterwards, any command (the MCP server
+  included) updates a skill copy setup installed when a newer api-anything runs, unless the copy was edited.
+  --agents       connect these agents only, found or not (claude-code,codex,cursor,claude-desktop,hermes,
+                 gemini,vscode). all: every one found but Hermes (all,hermes adds it)
+  --yes          share: answer the sharing question yes without asking
+  --no-share     do not share or report; answer it no (verification goes off too)
+  --verify       let an idle MCP server test up to 20 new shared operations a day from your network,
+                 with no cookies, on public https hosts only. Needs sharing on
+  --no-verify    no background verification (the default)
+  --local-only   send nothing to the shared catalog: no search, pull, reports, verification, sharing or
+                 publish. API_ANYTHING_LOCAL_ONLY=1 does the same for one environment
+  --no-local-only  reach the catalog again
+  --pin          write api-anything@<this version> into each config instead of the newest release; run
+                 it again from a newer version to move the pin
+  --share-only   record --yes/--no-share, --verify/--no-verify and --local-only/--no-local-only and nothing
+                 else: no agent, skill or key is touched. learn_site asks the sharing question the first
+                 time something could be shared; this records the answer given in chat, and changes it later
+  --dry-run      print what would change, and change nothing`,
   learn: `api-anything learn <trigger> --args k=v --args2 k=v --args3 k=v [--site s] [--op o] [--intent text] [options]
   Learns a read in one step and returns the answer to --args (as MCP learn_site does): runs the page with
   --args and --args2, picks the request carrying them and the fields from the first run's outline, saves
@@ -373,7 +444,7 @@ const HELP: Record<string, string> = {
 
 const USAGE = `api-anything ${VERSION}: turn a website into operations an agent can call.
 
-  api-anything setup [--yes | --no-share] [--dry-run]
+  api-anything setup [--agents claude-code,...] [--yes | --no-share] [--verify] [--local-only] [--pin] [--dry-run]
   api-anything learn <url-template> --args k=v --args2 k=v --args3 k=v
   api-anything login <site|url> [--profile ... | --window | --cookies <file>]
   api-anything logout <site>
@@ -391,6 +462,7 @@ const USAGE = `api-anything ${VERSION}: turn a website into operations an agent 
   api-anything heals [site] | revert <site> <op> | status [site]
   api-anything stats [--days n] [--card]
   api-anything mcp [--allow-writes] [--sites a,b] [--print-config]
+  api-anything serve [--host 127.0.0.1] [--port 8787] [--allow-writes] [--cors <origin>]
 
 api-anything <command> --help for details. Data lives in ~/.api-anything (API_ANYTHING_HOME overrides).`;
 
@@ -488,6 +560,10 @@ const OPTIONS = {
   pick: { type: "string" },
   fields: { type: "string" },
   "max-chars": { type: "string" },
+  "max-age": { type: "string" },
+  changes: { type: "boolean" },
+  "changes-only": { type: "boolean" },
+  watch: { type: "string" },
   offset: { type: "string" },
   format: { type: "string" },
   html: { type: "string" },
@@ -526,12 +602,22 @@ const OPTIONS = {
   agents: { type: "string" },
   "dry-run": { type: "boolean" },
   "no-share": { type: "boolean" },
+  verify: { type: "boolean" },
+  "no-verify": { type: "boolean" },
+  "local-only": { type: "boolean" },
+  "no-local-only": { type: "boolean" },
+  pin: { type: "boolean" },
   "share-only": { type: "boolean" },
   "no-learn": { type: "boolean" },
   paging: { type: "string" },
   find: { type: "string" },
   sites: { type: "string" },
   "print-config": { type: "boolean" },
+  host: { type: "string" },
+  port: { type: "string" },
+  cors: { type: "string", multiple: true },
+  "public-url": { type: "string" },
+  "max-concurrent": { type: "string" },
   days: { type: "string" },
   card: { type: "boolean" },
 } as const;
@@ -578,10 +664,25 @@ async function cmdLogin({ v, pos }: Parsed): Promise<number> {
 
   // what a signed-out visit is given, so those names do not pass for a sign-in
   const guest = await knownGuests(site, url, loginCookies);
+  const tty = process.stdin.isTTY && process.stderr.isTTY;
   let imported: Awaited<ReturnType<typeof importSession>>;
   try {
-    imported = await importSession(site, url, { loginCookies, profile: v.profile, file: v.cookies, guest });
+    imported = await importSession(site, url, {
+      loginCookies,
+      profile: v.profile,
+      file: v.cookies,
+      guest,
+      ...(tty ? { confirm: (q: string) => askYesNo(q, false) } : {}),
+    });
   } catch (e) {
+    if (e instanceof ImportRefused)
+      throw new Fail(
+        e.message,
+        e.declined
+          ? `nothing was read. To sign in without your browser's cookies: api-anything login ${site} --window`
+          : `ask the user to run in a terminal: api-anything login ${site} (it asks before reading their browser's cookies), or to sign in in a window of its own: api-anything login ${site} --window. Automation the user set up can pre-approve the domain: API_ANYTHING_ALLOW_IMPORT=${e.domain}`,
+        { site },
+      );
     if (!(e instanceof AmbiguousProfile)) throw e;
     throw new Fail(
       e.message,
@@ -934,6 +1035,8 @@ function pagingOf(flag: string | undefined): Paging | undefined {
 /** What a repair says it changed: the op was kept, and one thing in it replaced. */
 async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
   const [site, name] = pos;
+  // one instant for every capture this add reads: a pair is not half-refused at the 24 h edge
+  const admitted = Date.now();
   if (!site || !name) throw new Fail("missing <site> <op>", "api-anything add --help");
   if (!v.trigger && !v.from) throw new Fail("missing --trigger (or --from <captureId>)", "api-anything add --help");
   const ex1 = kv(v.example);
@@ -950,7 +1053,7 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
   if (v.from2 && !ex2)
     throw new Fail("--from2 needs --example2 (the values that capture was made with)", "api-anything add --help");
   if (v.from && ex2 && !v.from2) {
-    const c = loadCapture(v.from);
+    const c = loadCapture(v.from, admitted);
     const write = !!(c.write || v.write);
     const again = captureAgain(c, ex1, ex2, write);
     throw new Fail(
@@ -980,14 +1083,14 @@ async function cmdAdd({ v, pos, steps }: Parsed): Promise<number> {
     },
     public: v.public ? v.public.split(",").map((s) => s.trim().toLowerCase()) : undefined,
     from: v.from
-      ? { capture: loadCapture(v.from), id: v["pick-request"] ? Number(v["pick-request"]) : undefined }
+      ? { capture: loadCapture(v.from, admitted), id: v["pick-request"] ? Number(v["pick-request"]) : undefined }
       : undefined,
-    from2: v.from2 ? loadCapture(v.from2) : undefined,
+    from2: v.from2 ? loadCapture(v.from2, admitted) : undefined,
     allowed: allowedOf(v),
     paging: pagingOf(v.paging),
   });
   const op = r.operation;
-  const c = v.from && !v.paging && !op.paging ? loadCapture(v.from) : undefined;
+  const c = v.from && !v.paging && !op.paging ? loadCapture(v.from, admitted) : undefined;
   // the request learned, or the one before it, is one of two pages of a list the capture loaded
   const paged =
     c &&
@@ -1064,11 +1167,34 @@ async function cmdBatch({ v, pos }: Parsed): Promise<number> {
     maxItems,
     concurrency,
     maxTier: v["max-tier"] ? (Number(v["max-tier"]) as Tier) : undefined,
+    ...watchOptions(v, "batch"),
   })) {
     if (!out(r)) await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
     if (!r.ok) code = 1;
   }
   return code;
+}
+
+/** --max-age, --changes and --changes-only, as call options. */
+function watchOptions(
+  v: Parsed["v"],
+  command: string,
+): Pick<CallOptions, "maxAgeMs" | "changes" | "changesOnly" | "watch"> {
+  let maxAgeMs: number | undefined;
+  if (v["max-age"] !== undefined) {
+    maxAgeMs = parseDuration(v["max-age"]);
+    if (maxAgeMs === undefined)
+      throw new Fail(
+        `--max-age must be a duration such as 30s, 10m, 2h or 1d, got "${v["max-age"]}"`,
+        `api-anything ${command} --help`,
+      );
+  }
+  return {
+    ...(maxAgeMs !== undefined ? { maxAgeMs } : {}),
+    ...(v.changes ? { changes: true } : {}),
+    ...(v["changes-only"] ? { changesOnly: true } : {}),
+    ...(v.watch !== undefined ? { watch: v.watch } : {}),
+  };
 }
 
 function callView(v: Parsed["v"]): ResultView {
@@ -1101,6 +1227,7 @@ async function cmdCall({ v, pos }: Parsed): Promise<number> {
   if (v["max-tier"] !== undefined && !/^[123]$/.test(v["max-tier"]))
     throw new Fail(`--max-tier must be 1, 2 or 3, got "${v["max-tier"]}"`, "pass --max-tier 1, 2 or 3");
   const view = callView(v);
+  const watch = watchOptions(v, "call");
   let base: Record<string, unknown> = {};
   if (v.json) {
     if (v.json === "-") {
@@ -1139,6 +1266,7 @@ async function cmdCall({ v, pos }: Parsed): Promise<number> {
     maxTier,
     ignoreCoolDown: v.force,
     view,
+    ...watch,
   });
   out(pulled ? { ...r, pulled: site } : r);
   if (r.heal) process.stderr.write(healNote(site, name, r.heal));
@@ -1168,7 +1296,9 @@ function cmdHeals({ pos }: Parsed): number {
 }
 
 function cmdStatus({ pos }: Parsed): number {
-  out(status(pos[0] ? requireSite(pos[0]).site.name : undefined));
+  if (pos[0]) out(status(requireSite(pos[0]).site.name));
+  // the whole install: also which agent configs run a pinned version (setup --pin), or the newest release
+  else out({ ...status(), configs: configPins() });
   return 0;
 }
 
@@ -1405,6 +1535,7 @@ function cmdOps({ pos, v }: Parsed): number {
   }
   if (pos.length !== 1) throw new Fail("use <op> with --schema", `api-anything ops ${site.name} <op> --schema`);
   const notes = siteNotes(site.name);
+  const pace = sitePace(site);
   const about = (p: Operation["params"][number]) => [
     ...(p.description ? [p.description] : []),
     ...(p.example !== undefined ? [`e.g. ${JSON.stringify(p.example)}`] : []),
@@ -1430,8 +1561,10 @@ function cmdOps({ pos, v }: Parsed): number {
         : {}),
       ...(o.readback ? { readback: readbackName(o.readback) } : {}),
       ...(o.unproven ? { unproven: o.unproven.reason } : {}),
+      ...(o.response.key ? { key: o.response.key } : {}),
       ...(o.trigger ? { trigger: o.trigger.url } : {}),
     })),
+    ...(Object.keys(pace).length ? { pace } : {}),
     ...(site.shared ? { shared: SHARED_NOTE } : {}),
     ...(notes ? { notes } : {}),
   });
@@ -1477,9 +1610,12 @@ async function cmdSearch({ pos }: Parsed): Promise<number> {
     query,
     matches: r.matches,
     ...(r.registryError ? { registryError: r.registryError } : {}),
+    ...(r.localOnly ? { localOnly: r.localOnly } : {}),
     ...(r.matches.length ? { shared: SHARED_NOTE } : {}),
     next: !top
-      ? "nothing matched. Broaden the query or check api-anything sites before learning. Words find only sites whose operations other installs confirmed: if you know the site's domain or a page URL, search with that, which also finds unconfirmed ones; else learn it with api-anything learn"
+      ? r.localOnly
+        ? "nothing on this machine matched, and the shared catalog was not asked (local-only). Check api-anything sites, or learn it with api-anything learn"
+        : "nothing matched. Broaden the query or check api-anything sites before learning. Words find only sites whose operations other installs confirmed: if you know the site's domain or a page URL, search with that, which also finds unconfirmed ones; else learn it with api-anything learn"
       : !top.operations.length && top.interfaces?.length
         ? `${top.domain} offers its own agent interface: ${top.interfaces.map((i) => `${i.kind} ${i.url}`).join(", ")}`
         : r.matches.every((m) => m.unmatched.length)
@@ -1510,9 +1646,11 @@ async function cmdPull({ pos }: Parsed): Promise<number> {
       (e as Error).message,
       missing
         ? `nobody shared ${pos[0]} yet: learn it with api-anything capture and add, then share it with api-anything publish`
-        : e instanceof RegistryError
-          ? "the registry request failed, not the spec: check the network (and API_ANYTHING_REGISTRY if it is set), then retry"
-          : "do not edit the pulled spec to get past this; learn the site with capture and add instead",
+        : e instanceof LocalOnlyError
+          ? localOnlyOff()
+          : e instanceof RegistryError
+            ? "the registry request failed, not the spec: check the network (and API_ANYTHING_REGISTRY if it is set), then retry"
+            : "do not edit the pulled spec to get past this; learn the site with capture and add instead",
     );
   }
   out({
@@ -1528,6 +1666,11 @@ async function cmdPull({ pos }: Parsed): Promise<number> {
 async function cmdPublish({ v, pos }: Parsed): Promise<number> {
   const [name, ...ops] = pos;
   const { site } = requireSite(name);
+  if (localOnly())
+    throw new Fail(
+      `refusing to publish ${site.name}: this install is local-only, so nothing is sent to the shared catalog`,
+      localOnlyOff(),
+    );
   const again = `api-anything publish ${[site.name, ...ops].join(" ")}`;
   let p: ReturnType<typeof plan>;
   try {
@@ -1575,30 +1718,56 @@ async function cmdPublish({ v, pos }: Parsed): Promise<number> {
 }
 
 async function cmdSetup({ v }: Parsed): Promise<number> {
-  if (v.yes && v["no-share"]) throw new Fail("--yes and --no-share contradict each other", "pass one of them");
-  if (v["share-only"]) {
-    if (!v.yes && !v["no-share"])
-      throw new Fail("--share-only records an answer: pass --yes or --no-share with it", "api-anything setup --help");
-    const share = !!v.yes;
-    if (!v["dry-run"]) answerShare(share);
-    out({ ok: true, ...(v["dry-run"] ? { dryRun: true } : {}), share, shareAsked: true });
-    process.stderr.write(
-      `Sharing: ${v["dry-run"] ? "would be " : ""}${share ? "on. Turn it off with api-anything setup --no-share --share-only" : "off. Turn it on with api-anything setup --yes --share-only"}\n`,
+  const pair = (on: Flag, off: Flag) => {
+    if (v[on] && v[off]) throw new Fail(`--${on} and --${off} contradict each other`, "pass one of them");
+    return v[on] ? true : v[off] ? false : undefined;
+  };
+  const share = pair("yes", "no-share");
+  const verify = pair("verify", "no-verify");
+  const offline = pair("local-only", "no-local-only");
+  if (verify && (share === false || (share === undefined && !loadSettings().share)))
+    throw new Fail(
+      "background verification reports its outcomes to the shared catalog, so it needs sharing on",
+      "api-anything setup --yes --verify (add --share-only to change nothing else)",
     );
+  const dryRun = !!v["dry-run"];
+  if (v["share-only"]) {
+    if (share === undefined && verify === undefined && offline === undefined)
+      throw new Fail(
+        "--share-only records answers: pass --yes or --no-share, --verify or --no-verify, or --local-only or --no-local-only with it",
+        "api-anything setup --help",
+      );
+    if (v.agents || v.pin)
+      throw new Fail(
+        "--share-only touches no agent: --agents and --pin need a setup without it",
+        "api-anything setup --help",
+      );
+    if (offline !== undefined && !dryRun) setLocalOnly(offline);
+    const r = { ...(await record({ share, verify }, { dryRun })), localOnly: offline ?? localOnly() };
+    out({ ok: true, ...(dryRun ? { dryRun: true } : {}), ...r });
+    process.stderr.write(`${answersSummary({ ...r, ...(dryRun ? { dryRun: true as const } : {}) }).join("\n")}\n`);
     return 0;
   }
-  const agents = v.agents?.split(",").map((a) => a.trim());
-  const unknown = agents?.filter((a) => !(AGENTS as readonly string[]).includes(a));
-  if (unknown?.length)
+  const agents = v.agents
+    ?.split(",")
+    .map((a) => a.trim())
+    .filter(Boolean);
+  const unknown = agents?.filter((a) => a !== "all" && !(AGENTS as readonly string[]).includes(a));
+  if (unknown?.length || agents?.length === 0)
     throw new Fail(
-      `unknown agent ${unknown.join(", ")}; the agents are ${AGENTS.join(", ")}`,
+      `unknown agent ${unknown?.join(", ") || "(none named)"}; the agents are ${AGENTS.join(", ")}, or all (every one found but Hermes)`,
       "api-anything setup --help",
     );
+  const tty = process.stdin.isTTY && process.stderr.isTTY;
   const r = await setup({
-    agents: agents as Agent[] | undefined,
-    dryRun: v["dry-run"],
-    share: v.yes ? true : v["no-share"] ? false : undefined,
-    ask: process.stdin.isTTY && process.stderr.isTTY ? askYesNo : undefined,
+    agents: agents as (Agent | "all")[] | undefined,
+    choose: tty ? askAgents : undefined,
+    dryRun,
+    share,
+    verify,
+    localOnly: offline,
+    pin: v.pin,
+    ask: tty ? askYesNo : undefined,
   });
   out(r);
   process.stderr.write(`${summary(r)}\n`);
@@ -1650,12 +1819,122 @@ async function cmdMcp({ v }: Parsed): Promise<number> {
       ...(sites.length ? ["--sites", sites.join(",")] : []),
       ...(v["no-learn"] ? ["--no-learn"] : []),
     ];
-    process.stdout.write(`${printConfig(launchOf(fileURLToPath(import.meta.url), flags))}\n`);
+    const here = launchOf(fileURLToPath(import.meta.url), flags);
+    // pinned: npx fetches exactly this version at each start, not the newest release
+    const pinned = v.pin ? guiServer(true) : undefined;
+    const launch = pinned
+      ? { command: pinned.command, args: [...pinned.args, ...flags], env: { ...pinned.env, ...here.env } }
+      : here;
+    process.stdout.write(`${printConfig(launch)}\n`);
     return 0;
   }
+  if (v.pin) throw new Fail("--pin goes with --print-config", "api-anything mcp --print-config --pin");
   const { serveStdio } = await import("./mcp.js");
   await serveStdio({ allowWrites: v["allow-writes"], sites });
   return -1; // keep serving
+}
+
+async function cmdServe({ v }: Parsed): Promise<number> {
+  const { DEFAULT_PORT, guardProcess, isLoopback, MAX_CONCURRENT, originOf, serve, serveToken } = await import(
+    "./serve.js"
+  );
+  if (v["no-learn"]) (await import("./mcp-learn.js")).learnTool.enabled = false;
+  const sites = (v.sites ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const s of sites) if (!loadSite(s)) throw new Fail(`no site "${s}"`, "api-anything sites lists them");
+  const host = v.host ?? "127.0.0.1";
+  const port = v.port === undefined ? DEFAULT_PORT : Number(v.port);
+  if (!Number.isInteger(port) || port < 0 || port > 65535)
+    throw new Fail(`--port ${v.port}: not a port`, "a number from 0 (any free port) to 65535");
+  const maxConcurrent = v["max-concurrent"] === undefined ? MAX_CONCURRENT : Number(v["max-concurrent"]);
+  if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1)
+    throw new Fail(`--max-concurrent ${v["max-concurrent"]}: not a count`, "a whole number, at least 1");
+  const cors = (v.cors ?? [])
+    .flatMap((c) => c.split(","))
+    .map((c) => c.trim())
+    .filter(Boolean);
+  try {
+    cors.forEach(originOf);
+    if (v["public-url"]) new URL(v["public-url"]);
+  } catch (e) {
+    throw new Fail((e as Error).message, "api-anything serve --help");
+  }
+  const base = `http://${host.includes(":") ? `[${host}]` : host}:${port || DEFAULT_PORT}`;
+  if (v["print-config"]) {
+    process.stdout.write(`${serveExamples(v["public-url"] ?? base)}\n`);
+    return 0;
+  }
+  const { token, file } = serveToken();
+  guardProcess();
+  const served = await serve({
+    host,
+    port,
+    allowWrites: v["allow-writes"],
+    sites,
+    cors,
+    token,
+    maxConcurrent,
+    ...(v["public-url"] ? { publicUrl: v["public-url"] } : {}),
+  });
+  const url = v["public-url"] ? new URL(v["public-url"]).origin : served.url;
+  out({
+    ok: true,
+    version: VERSION,
+    url,
+    mcp: `${url}/mcp`,
+    openapi: `${url}/openapi.json`,
+    ...(file ? { tokenFile: file } : { tokenEnv: "API_ANYTHING_TOKEN" }),
+  });
+  if (!isLoopback(host))
+    process.stderr.write(
+      `api-anything serve: listening on ${host}, not loopback: anyone who reaches this address and has the token can use your signed-in sessions\n`,
+    );
+  if (process.stderr.isTTY)
+    process.stderr.write(
+      `api-anything serve: send Authorization: Bearer <token>; the token is ${file ? `in ${file}` : "API_ANYTHING_TOKEN"}\n`,
+    );
+  let stopping = false;
+  const stop = () => {
+    if (stopping) process.exit(130); // a second signal: stop now
+    stopping = true;
+    void served
+      .close()
+      .then(() => settle(1500))
+      .then(closeBrowser)
+      .finally(() => process.exit(0));
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  return -1; // keep serving
+}
+
+/** `serve --print-config`: how an HTTP client reaches this server, with the token left as a placeholder. */
+function serveExamples(base: string): string {
+  return [
+    "# the token: cat ~/.api-anything/serve-token (or API_ANYTHING_TOKEN)",
+    `curl -s ${base}/v1/health`,
+    `curl -s -H "Authorization: Bearer $TOKEN" ${base}/v1/sites`,
+    `curl -s -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"args":{"query":"sqlite"}}' ${base}/v1/call/hacker-news/search`,
+    "",
+    "# MCP over HTTP (Streamable HTTP), for a client that takes a URL and headers:",
+    JSON.stringify({ url: `${base}/mcp`, headers: { Authorization: "Bearer <token>" } }),
+    "",
+    "# n8n: an HTTP Request node",
+    JSON.stringify({
+      method: "POST",
+      url: `${base}/v1/call/hacker-news/search`,
+      authentication: "genericCredentialType",
+      genericAuthType: "httpBearerAuth",
+      sendBody: true,
+      contentType: "json",
+      specifyBody: "json",
+      jsonBody: '{"args":{"query":"sqlite"}}',
+    }),
+    "",
+    `# OpenAPI 3.1 (with the token): ${base}/openapi.json`,
+  ].join("\n");
 }
 
 type Flag = keyof typeof OPTIONS;
@@ -1690,10 +1969,27 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
       "paging",
     ],
   },
-  batch: { run: cmdBatch, flags: ["input", "concurrency", "limit", "max-tier"] },
+  batch: {
+    run: cmdBatch,
+    flags: ["input", "concurrency", "limit", "max-tier", "max-age", "changes", "changes-only", "watch"],
+  },
   call: {
     run: cmdCall,
-    flags: ["json", "allow-writes", "again", "idempotency-key", "max-tier", "force", "dry", "fields", "max-chars"],
+    flags: [
+      "json",
+      "allow-writes",
+      "again",
+      "idempotency-key",
+      "max-tier",
+      "force",
+      "dry",
+      "fields",
+      "max-chars",
+      "max-age",
+      "changes",
+      "changes-only",
+      "watch",
+    ],
   },
   result: { run: cmdResult, flags: ["offset", "fields", "max-chars", "format"] },
   verify: { run: cmdVerify, flags: ["user", "strict"] },
@@ -1711,8 +2007,36 @@ const COMMANDS: Record<string, { run: (p: Parsed) => number | Promise<number>; f
   interface: { run: cmdInterface, flags: [] },
   pull: { run: cmdPull, flags: [] },
   publish: { run: cmdPublish, flags: ["yes"] },
-  mcp: { run: cmdMcp, flags: ["allow-writes", "sites", "print-config", "no-learn"] },
-  setup: { run: cmdSetup, flags: ["yes", "no-share", "share-only", "agents", "dry-run"] },
+  mcp: { run: cmdMcp, flags: ["allow-writes", "sites", "print-config", "no-learn", "pin"] },
+  serve: {
+    run: cmdServe,
+    flags: [
+      "host",
+      "port",
+      "allow-writes",
+      "sites",
+      "no-learn",
+      "cors",
+      "public-url",
+      "max-concurrent",
+      "print-config",
+    ],
+  },
+  setup: {
+    run: cmdSetup,
+    flags: [
+      "yes",
+      "no-share",
+      "verify",
+      "no-verify",
+      "local-only",
+      "no-local-only",
+      "pin",
+      "share-only",
+      "agents",
+      "dry-run",
+    ],
+  },
   learn: {
     run: cmdLearn,
     flags: [
@@ -1770,6 +2094,7 @@ async function run(argv: string[]): Promise<number> {
   return c.run({ v, pos, steps: stepsOf(v.steps) });
 }
 
+onPlaintext((why) => process.stderr.write(`${plaintextWarning(why)}\n`));
 try {
   const code = await run(process.argv.slice(2));
   if (code >= 0) {
@@ -1785,7 +2110,12 @@ try {
   out({ ok: false, error: oneLine((e as Error).message), ...(f?.extra ?? {}) });
   const next =
     f?.next ??
-    (e instanceof ProfileInUse ? PROFILE_HINT : `api-anything ${process.argv[2] ?? ""} --help`.replace(/\s+/g, " "));
+    (e instanceof CaptureUnavailable || e instanceof SealError ? e.next : undefined) ??
+    (e instanceof ProfileInUse
+      ? PROFILE_HINT
+      : e instanceof LocalOnlyError
+        ? localOnlyOff()
+        : `api-anything ${process.argv[2] ?? ""} --help`.replace(/\s+/g, " "));
   process.stderr.write(`next: ${next}\n`);
   process.exitCode = 1;
 }

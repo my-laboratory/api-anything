@@ -1,7 +1,8 @@
 # Agent frameworks
 
 API Anything is an MCP server that runs over stdio, so any framework with an MCP client can use it.
-The server is the same everywhere:
+A framework that cannot start a local process can use `api-anything serve` instead, which serves
+the same tools over HTTP (last row below). The server is the same everywhere:
 
 ```json
 { "command": "npx", "args": ["-y", "api-anything", "mcp"] }
@@ -17,7 +18,9 @@ and listed its tools.
 | Vercel AI SDK (TypeScript) | [examples/vercel-ai-sdk.mjs](../examples/vercel-ai-sdk.mjs) | `npm install ai @ai-sdk/mcp @ai-sdk/anthropic` |
 | LangChain.js | [examples/langchain.mjs](../examples/langchain.mjs) | `npm install langchain @langchain/anthropic @langchain/mcp-adapters @langchain/core @langchain/langgraph` |
 | OpenAI Agents SDK (Python) | [examples/openai-agents.py](../examples/openai-agents.py) | `pip install openai-agents` |
+| Python client over HTTP (`api-anything serve`): LangChain/LangGraph, OpenAI Agents SDK, any framework that takes a JSON Schema | [examples/python-agent.py](../examples/python-agent.py), [PYTHON.md](PYTHON.md) | `pip install openai-agents "git+https://github.com/goodnight000/api-anything#subdirectory=python"` |
 | Plain MCP SDK, no model | [examples/mcp-call.mjs](../examples/mcp-call.mjs) | `npm install @modelcontextprotocol/sdk` |
+| Anything that speaks HTTP: n8n, Make, Zapier, Dify, Flowise, Postman, a custom GPT, any language | [SERVE.md](SERVE.md): REST, MCP over HTTP and an OpenAPI document | `npx -y api-anything serve` |
 
 Each example takes a question as its arguments:
 
@@ -25,7 +28,13 @@ Each example takes a question as its arguments:
 ANTHROPIC_API_KEY=... node examples/vercel-ai-sdk.mjs "What does Goodreads rate Piranesi?"
 ANTHROPIC_API_KEY=... node examples/langchain.mjs "Top Hacker News stories about sqlite"
 OPENAI_API_KEY=... python examples/openai-agents.py "What does Goodreads rate Piranesi?"
+OPENAI_API_KEY=... python examples/python-agent.py "Top Hacker News stories about sqlite"
 ```
+
+The Python client ([PYTHON.md](PYTHON.md) says how to install it) starts the server itself and gives each operation a
+tool of its own, `<site>__<op>`, in OpenAI, Anthropic or plain JSON Schema form, with adapters for
+LangChain and the OpenAI Agents SDK. It also writes typed modules for a site's operations.
+[PYTHON.md](PYTHON.md) covers it.
 
 ## The tools
 
@@ -57,9 +66,14 @@ shared site first, call it, learn it only when nothing is shared, and answer a `
   plain HTTP; start the server with `mcp --no-learn` to hide `learn_site`.
 - **Where things are kept.** Learned sites, sessions and settings live in `~/.api-anything`. Set
   `API_ANYTHING_HOME` in the server's environment to keep them somewhere else, for example a volume
-  that outlives the container.
+  that outlives the container. Sessions and captures are sealed under a key from the OS store, which
+  a container usually lacks: set `API_ANYTHING_KEY` to a passphrase from the platform's secret store
+  to seal them there, or `API_ANYTHING_PLAINTEXT=1` to keep them as 0600 plaintext without a warning.
+  The passphrase must stay the same for as long as the home does.
 - **Sharing.** Until someone answers the sharing question (`npx -y api-anything setup`, or the
   question `learn_site` asks once), nothing is shared or reported. For a non-interactive install,
   record the answer first: `npx -y api-anything setup --share-only --no-share` (or `--yes`).
+  Background verification is its own setting, off unless `--verify` is given. To keep a server off
+  the shared catalog entirely, searches included, set `API_ANYTHING_LOCAL_ONLY=1` in its environment.
 - **Writes.** Leave `--allow-writes` off unless the agent should send writes, such as posting or
   buying, and the framework asks a person before each one.

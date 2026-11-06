@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIPv4, isIPv6 } from "node:net";
 import * as zlib from "node:zlib";
+import type { SendBudget } from "./budget.js";
 import { asText, fillSlotTemplate, setAt, templateRefs, walk } from "./codec.js";
 import { matches } from "./learn.js";
 import { cookieHeaderFor, cookieValue, parseSetCookie, type Session } from "./session.js";
@@ -40,6 +41,8 @@ export interface SendOptions {
   publicOnly?: boolean;
   /** the call's seed for its gen slots (`buildRequest`) */
   gen?: string;
+  /** the site's budget, checked and counted at the send (`pace`) */
+  budget?: SendBudget;
 }
 
 /** How a public-only send resolves a host before connecting; tests replace it, since they stay off the network. */
@@ -255,8 +258,8 @@ export function refusal(p: Pick<Param, "pattern" | "hint" | "enum" | "min" | "ma
   return undefined;
 }
 
-/** The op's params as this call runs them: defaults applied, types coerced, pattern/enum/bounds checked. */
-export function preparedValues(op: Operation, args: Record<string, unknown>): Record<string, unknown> {
+/** The args as the request carries them: defaults filled, each coerced to its param's type and checked; throws when one cannot go. */
+export function requestArgs(op: Operation, args: Record<string, unknown>): Record<string, unknown> {
   const given = withDefaults(op, args);
   const vals: Record<string, unknown> = {};
   for (const p of op.params) {
@@ -277,7 +280,7 @@ export function preparedValues(op: Operation, args: Record<string, unknown>): Re
  * seed; without one each build makes new values), and the jar's Cookie header.
  */
 export function buildRequest(op: Operation, args: Record<string, unknown>, session: Session, gen?: string): Request {
-  const vals = preparedValues(op, args);
+  const vals = requestArgs(op, args);
   const request = op.request!; // a request op: this is never called for a local op
   let req: Request = { ...request, method: request.method.toUpperCase(), headers: { ...request.headers } };
   let leafTypes: Map<string, string> | undefined;
@@ -342,10 +345,15 @@ export class BadHeader extends Error {
   }
 }
 
-/** Reserve the next send slot for a site, then wait for it; concurrent callers, in any process, queue up. */
-export async function pace(site: string, minIntervalMs = 1000): Promise<void> {
-  if (minIntervalMs <= 0) return;
-  const wait = reserveSend(site, minIntervalMs) - Date.now();
+/**
+ * Reserve the next send slot for a site, then wait for it; concurrent callers, in any process, queue
+ * up. Under a `budget` the reservation checks and counts it in the same locked step, and throws
+ * `BudgetSpent` without reserving when the send would go over it.
+ */
+export async function pace(site: string, minIntervalMs = 1000, budget?: SendBudget): Promise<void> {
+  if (minIntervalMs <= 0 && !budget) return;
+  const at = reserveSend(site, Math.max(0, minIntervalMs), Date.now(), budget);
+  const wait = at - Date.now();
   if (wait > 0) await new Promise((r) => setTimeout(r, wait));
 }
 
@@ -498,7 +506,7 @@ export async function send(
 ): Promise<Sent> {
   const req = buildRequest(op, args, session, opts.gen);
   if (opts.publicOnly) await refusePrivate(op, req.url);
-  await pace(opts.site, opts.minIntervalMs);
+  await pace(opts.site, opts.minIntervalMs, opts.budget);
   const timeoutMs = opts.timeoutMs ?? 30_000;
   const signal = AbortSignal.timeout(timeoutMs);
   let hop: Request = { ...req, body: req.method === "GET" || req.method === "HEAD" ? undefined : req.body };

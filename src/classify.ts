@@ -82,7 +82,7 @@ const CHALLENGES: [string, RegExp | undefined, RegExp?][] = [
   ["Anubis", /<script id="anubis-main"|Making sure you(?:'|&#39;)re not a bot!/i],
   ["Kasada", undefined, /\/[0-9a-f]{8}-[0-9a-f-]{27}\/[0-9a-f]{8}-[0-9a-f-]{27}\/ips\.js/i],
   // a proof-of-work page that solves itself and resubmits (Reddit)
-  ["JS challenge", /name=["']?js_challenge|[?&]js_challenge=1/i],
+  ["JavaScript", /name=["']?js_challenge|[?&]js_challenge=1/i],
   ["reCAPTCHA", /Prove your humanity/i],
 ];
 // A CAPTCHA widget is the challenge on a bare page, and a guard on the login when it sits in a sign-in form.
@@ -239,15 +239,19 @@ export function emptyResults(body: string, recipe: { items: string; empty?: stri
   }
 }
 
+/** The longest wait a Retry-After is taken at: a huge one would be Infinity, which JSON sends as null. */
+export const MAX_RETRY_AFTER_MS = 24 * 3600_000;
+
 /** " (retry after 120 s)" and its wait in ms, from a Retry-After header in seconds or as an HTTP date. */
 function retryAfter(headers: Record<string, string>, now = Date.now()): { text: string; ms?: number } {
   const v = headers["retry-after"]?.trim();
   if (!v) return { text: "" };
-  if (/^\d+$/.test(v)) return { text: ` (the server says retry after ${v} s)`, ms: Number(v) * 1000 };
+  const wait = (ms: number) => Math.min(Math.max(0, ms), MAX_RETRY_AFTER_MS);
+  if (/^\d+$/.test(v)) return { text: ` (the server says retry after ${v} s)`, ms: wait(Number(v) * 1000) };
   const t = Date.parse(v);
   return Number.isNaN(t)
     ? { text: "" }
-    : { text: ` (the server says retry after ${new Date(t).toISOString()})`, ms: Math.max(0, t - now) };
+    : { text: ` (the server says retry after ${new Date(t).toISOString()})`, ms: wait(t - now) };
 }
 
 /** A GraphQL errors array's verdict; `input` for a not-found entity. */
